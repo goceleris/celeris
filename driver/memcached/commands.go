@@ -196,7 +196,7 @@ func (c *Client) storeCmd(ctx context.Context, cmd string, key string, value []b
 				}
 				return w.AppendStorage(opcode, key, value, 0, exp, 0, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -205,7 +205,7 @@ func (c *Client) storeCmd(ctx context.Context, cmd string, key string, value []b
 		req, err := conn.execText(ctx, kindStatusOnly, func(w *protocol.TextWriter) []byte {
 			return w.AppendStorage(cmd, key, 0, exptime(ttl), value, 0, false)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -316,7 +316,7 @@ func (c *Client) casBytes(ctx context.Context, key string, value []byte, casID u
 			req, err := conn.execBinary(ctx, protocol.OpSet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendStorage(protocol.OpSet, key, value, 0, exp, casID, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -334,7 +334,7 @@ func (c *Client) casBytes(ctx context.Context, key string, value []byte, casID u
 		req, err := conn.execText(ctx, kindStatusOnly, func(w *protocol.TextWriter) []byte {
 			return w.AppendStorage("cas", key, 0, exptime(ttl), value, casID, false)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -381,7 +381,7 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 			req, err := conn.execBinary(ctx, protocol.OpGet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendGet(protocol.OpGet, key, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -399,7 +399,7 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 		req, err := conn.execText(ctx, kindGet, func(w *protocol.TextWriter) []byte {
 			return w.AppendRetrieval("get", key)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -433,7 +433,7 @@ func (c *Client) GetMulti(ctx context.Context, keys ...string) (map[string]strin
 				func(w *protocol.BinaryWriter) []byte { return encodeGetMultiBatch(conn, w, keys) },
 				isGetMultiTerminator,
 			)
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -448,7 +448,7 @@ func (c *Client) GetMulti(ctx context.Context, keys ...string) (map[string]strin
 		req, err := conn.execText(ctx, kindGet, func(w *protocol.TextWriter) []byte {
 			return w.AppendRetrieval("get", keys...)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -480,7 +480,7 @@ func (c *Client) GetMultiBytes(ctx context.Context, keys ...string) (map[string]
 				func(w *protocol.BinaryWriter) []byte { return encodeGetMultiBatch(conn, w, keys) },
 				isGetMultiTerminator,
 			)
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -495,7 +495,7 @@ func (c *Client) GetMultiBytes(ctx context.Context, keys ...string) (map[string]
 		req, err := conn.execText(ctx, kindGet, func(w *protocol.TextWriter) []byte {
 			return w.AppendRetrieval("get", keys...)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -562,7 +562,7 @@ func (c *Client) Gets(ctx context.Context, key string) (CASItem, error) {
 			req, err := conn.execBinary(ctx, protocol.OpGet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendGet(protocol.OpGet, key, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -582,7 +582,7 @@ func (c *Client) Gets(ctx context.Context, key string) (CASItem, error) {
 		req, err := conn.execText(ctx, kindGet, func(w *protocol.TextWriter) []byte {
 			return w.AppendRetrieval("gets", key)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -630,7 +630,7 @@ func (c *Client) arith(ctx context.Context, cmd string, opcode byte, key string,
 			req, err := conn.execBinary(ctx, opcode, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendArith(opcode, key, delta, 0, 0xFFFFFFFF, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -658,7 +658,7 @@ func (c *Client) arith(ctx context.Context, cmd string, opcode byte, key string,
 		req, err := conn.execText(ctx, kindArith, func(w *protocol.TextWriter) []byte {
 			return w.AppendArith(cmd, key, delta)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -690,7 +690,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 			req, err := conn.execBinary(ctx, protocol.OpDelete, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendDelete(key, 0, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -705,7 +705,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 		req, err := conn.execText(ctx, kindStatusOnly, func(w *protocol.TextWriter) []byte {
 			return w.AppendDelete(key)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -734,7 +734,7 @@ func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error
 			req, err := conn.execBinary(ctx, protocol.OpTouch, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendTouch(key, exp, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -749,7 +749,7 @@ func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error
 		req, err := conn.execText(ctx, kindStatusOnly, func(w *protocol.TextWriter) []byte {
 			return w.AppendTouch(key, exptime(ttl))
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -787,7 +787,7 @@ func (c *Client) flush(ctx context.Context, delaySecs int64) error {
 			req, err := conn.execBinary(ctx, protocol.OpFlush, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendFlush(uint32(delaySecs), opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -802,7 +802,7 @@ func (c *Client) flush(ctx context.Context, delaySecs int64) error {
 			}
 			return w.AppendFlushAll(-1)
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -829,7 +829,7 @@ func (c *Client) Stats(ctx context.Context) (map[string]string, error) {
 				},
 				isStatsTerminator,
 			)
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -844,7 +844,7 @@ func (c *Client) Stats(ctx context.Context) (map[string]string, error) {
 		req, err := conn.execText(ctx, kindStats, func(w *protocol.TextWriter) []byte {
 			return w.AppendStats("")
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}
@@ -867,7 +867,7 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 			req, err := conn.execBinary(ctx, protocol.OpVersion, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 				return w.AppendSimple(protocol.OpVersion, opaque)
 			})
-			defer putRequest(req)
+			defer releaseRequest(conn, req, err)
 			if err != nil {
 				return err
 			}
@@ -882,7 +882,7 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 		req, err := conn.execText(ctx, kindVersion, func(w *protocol.TextWriter) []byte {
 			return w.AppendSimple("version")
 		})
-		defer putRequest(req)
+		defer releaseRequest(conn, req, err)
 		if err != nil {
 			return err
 		}

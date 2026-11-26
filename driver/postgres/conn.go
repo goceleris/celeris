@@ -193,6 +193,11 @@ type pgRequest struct {
 	// runtime lock chain would be corrupted by a zero-value overwrite).
 	doneMu   sync.Mutex
 	doneFlag bool
+	// abandoned is set under doneMu by a caller whose context ended while it
+	// waited for the reply (waitForQueryRows): the rows that still arrive are
+	// dropped, not buffered, so a cancel the server did not act on does not
+	// buffer the rest of the result.
+	abandoned bool
 	// doneAtom is the lockless mirror of doneFlag. The spin-wait fast path
 	// checks it without acquiring doneMu. Set to 1 by finish()/fail()
 	// immediately before signaling doneCh; reset to 0 in acquirePgRequest.
@@ -319,6 +324,7 @@ func acquirePgRequest() *pgRequest {
 	// channel. doneMu is NOT reset — its zero value is always a valid
 	// unlocked mutex, and a prior life cycle always left it unlocked.
 	r.doneFlag = false
+	r.abandoned = false
 	r.doneAtom.Store(0)
 	return r
 }
@@ -495,7 +501,7 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
 	r.doneMu.Lock()
 	defer r.doneMu.Unlock()
-	if r.doneFlag {
+	if r.doneFlag || r.abandoned {
 		return 0, false, false
 	}
 	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
@@ -541,6 +547,22 @@ func (r *pgRequest) setColumnsIfLive(cols []protocol.ColumnDesc) {
 	if !r.doneFlag {
 		r.columns = cols
 	}
+}
+
+// dropBufferedRows discards the rows buffered so far, unless the request is
+// done (see setColumnsIfLive): a failAll that completed it woke its caller,
+// who reads r.rows now. Dispatch runs it for a buffered request that is about
+// to fail with errMultiResultSets, whose caller must get the error and no rows.
+func (r *pgRequest) dropBufferedRows() {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return
+	}
+	for i := range r.rows {
+		r.rows[i] = nil
+	}
+	r.rows = r.rows[:0]
 }
 
 // setResultIfLive stores the extended query's command tag and, when none is set
@@ -1645,6 +1667,18 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// closure-pair allocation the previous inline funcs paid (-2
 		// allocs/op on the hot path; see PR description for full delta).
 		done, err := head.simple.Handle(msgType, payload, head)
+		if done && err == nil && head.simple.MultiSet {
+			// More than one statement returned rows. The whole reply has been
+			// read, up to this ReadyForQuery, so the conn is clean for the next
+			// query. A server error from one of the statements, if there was
+			// one, is err already and is reported as it always was.
+			err = errMultiResultSets
+			if head.rowCh == nil {
+				// Buffered: the caller gets the error and no rows, not the first
+				// set as if it were the answer.
+				head.dropBufferedRows()
+			}
+		}
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
@@ -2300,6 +2334,11 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
+	// A query that returns rows returns one result set: a second RowDescription
+	// is not parsed (it would rewrite the columns the caller holds) and the
+	// request fails at ReadyForQuery with errMultiResultSets. Exec leaves it
+	// off and keeps accepting any number of statements.
+	req.simple.RejectMultiSet = true
 	// Lazy streaming: colsCh fires when promoteToStreaming activates
 	// rowCh mid-dispatch, letting the caller goroutine switch to
 	// streaming mode instead of waiting for the full result set.
@@ -2434,6 +2473,14 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		case <-req.doneCh:
 		default:
 		}
+		if req.err == errMultiResultSets && req.rowCh != nil {
+			// The first set streamed and the whole reply, the error included,
+			// arrived before this select ran (a set of exactly streamThreshold
+			// rows): colsCh and doneCh are both ready and the select may pick
+			// this one. The rows are in rowCh, which is closed: deliver them
+			// and the error after them, as the colsCh branch does.
+			return drainStreamToPGRows(req, textFormat, req.err), nil
+		}
 		if req.err != nil {
 			// If rows were buffered before the error arrived (e.g.
 			// mid-stream ErrorResponse), return them with the error
@@ -2450,14 +2497,42 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		if req.rowCh != nil {
 			// Streaming was activated and the request completed before we
 			// entered this select. The rowCh is closed; drain it into pgRows.
-			return drainStreamToPGRows(req, textFormat), nil
+			return drainStreamToPGRows(req, textFormat, nil), nil
 		}
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
+		// The request is abandoned: nobody will read its rows. The select may
+		// take ctx.Done although colsCh is ready too (rowCh published), and a
+		// stream can be promoted after the select, while the cancel is sent.
+		// Left alone, the event-loop worker blocks in sendRow on the full rowCh,
+		// cannot read the server's cancel reply, and doneCh never fires; a
+		// worker serves every conn registered on it, so they all stall.
+		//
+		// So, before the cancel: abandoned makes the worker drop the rows that
+		// still arrive instead of buffering them (the server may not act on the
+		// cancel at once, or at all when it reaches an idle backend, and the
+		// rest of the result would pile up in req.rows), and closeRowCh releases
+		// a worker already blocked in sendRow and keeps a promotion from
+		// publishing a stream. The worker then reads on to ReadyForQuery. The
+		// rows buffered so far are dropped with the request.
+		req.doneMu.Lock()
+		req.abandoned = true
+		req.doneMu.Unlock()
+		req.closeRowCh()
 		confirmed := c.cancelRunning()
-		// A conn that cancelRunning failed completes req at once (failAll).
-		<-req.doneCh
+		// A conn that cancelRunning failed completes req at once (failAll). The
+		// wait is bounded as wait()'s is: a server that never answers the cancel
+		// fails the conn (the pool discards it) and the call returns anyway.
+		timer := time.NewTimer(cancelDrainTimeout)
+		select {
+		case <-req.doneCh:
+			timer.Stop()
+		case <-timer.C:
+			c.failAll(errors.New("celeris-postgres: cancel timeout"))
+			releasePgRequest(req)
+			return nil, ctx.Err()
+		}
 		reqErr := req.err
 		releasePgRequest(req)
 		if !confirmed {
@@ -2474,12 +2549,12 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 // into a buffered pgRows. Used by the sync fast path when the entire response
 // completed during WriteAndPoll — avoids the per-Next channel recv overhead
 // for small result sets.
-func drainStreamToPGRows(req *pgRequest, textFormat bool) *pgRows {
+func drainStreamToPGRows(req *pgRequest, textFormat bool, deferredErr error) *pgRows {
 	var rows [][][]byte
 	for row := range req.rowCh {
 		rows = append(rows, row)
 	}
-	return acquirePGRows(req.columns, rows, textFormat, req, nil)
+	return acquirePGRows(req.columns, rows, textFormat, req, deferredErr)
 }
 
 // simpleExec returns the command tag and rows-affected count. Callers may
