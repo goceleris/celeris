@@ -47,6 +47,13 @@
 // WithEngine colocation. It is tested in CI on windows-latest against
 // in-process fake servers, not benchmarked and not tuned; do not deploy it.
 //
+// # Errors from writes
+//
+// An error from a write does not prove that the write was not applied: a
+// connection that closes right after the server answered can be reported as a
+// failure (celeris#1460); do not blindly retry Incr, Decr or other
+// non-idempotent commands on a connection error.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores
