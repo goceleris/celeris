@@ -716,7 +716,13 @@ func (r *Rows) Columns() []string {
 	return r.inner.Columns()
 }
 
-// Close releases resources and returns the conn to the pool. A statement that
+// Close releases resources and returns the conn to the pool. It returns the
+// error the result ended with, whether or not iteration read it: the one [Rows.Err]
+// reports after a loop that ran to the end (the first Close then returns it as well)
+// and the one a caller that stopped after the rows it wanted would otherwise never
+// see (database/sql's Row.Scan relies on this). It is a connection lost before the
+// result was complete (matches [ErrClosed] and [io.ErrUnexpectedEOF]), a server
+// error after some rows, or [ErrResultTooBig]. Before v1.6.0 Close dropped it. A statement that
 // left a transaction open on the conn (Query "BEGIN") makes Close return
 // [ErrTxLeftOpen] after discarding the conn. A query in which more than one
 // statement returned rows fails with an error that says multiple result sets are
@@ -873,9 +879,9 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Err returns the first non-EOF error encountered during iteration. It is still
 // that error after Close. Always check it after the loop: on a direct-mode Pool
-// it is the only place that reports [ErrResultTooBig] (Next just returns false
-// and Close returns nil), and a server error that arrives after some rows is
-// reported here too.
+// it reports [ErrResultTooBig] (Next just returns false; Close returns it too),
+// and a server error that arrives after some rows, or a connection lost before
+// the result was complete, is reported here too.
 func (r *Rows) Err() error {
 	r.closemu.RLock()
 	defer r.closemu.RUnlock()
@@ -1370,7 +1376,11 @@ type Row struct {
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
 // is closed automatically, and a second Scan (the rows are gone) returns
-// sql.ErrNoRows too.
+// sql.ErrNoRows too. The row is returned only when the statement ended: a
+// connection lost after the row and before the statement's ReadyForQuery (an
+// INSERT ... RETURNING in autocommit commits at Sync, after the DataRow) makes
+// Scan return that error, as database/sql's Row.Scan does, and never
+// sql.ErrNoRows.
 func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
@@ -1381,20 +1391,22 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	r.rows = nil
 	defer func() {
-		// Only the error of a transaction left open on the conn, and the error
-		// of a query that returned more than one result set (it streamed: the
-		// first row is already scanned), are the caller's, and only when the
-		// scan went well or found no row; any other error of Close or of the
-		// scan is left as it was.
-		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) || cerr == errMultiResultSets {
-			switch {
-			case err == nil:
-				err = cerr
-			case errors.Is(err, sql.ErrNoRows):
-				// A statement that returns no row (QueryRow("BEGIN")): both
-				// are true, so a caller testing for either sees it.
-				err = errors.Join(err, cerr)
-			}
+		// The row is the answer only when the statement ended: a Close error
+		// (a connection lost before the ReadyForQuery, a server error that
+		// came after the row, a query that returned more than one result set,
+		// which streamed: its first row is already scanned) is Scan's error when
+		// the scan itself went well, as database/sql's Row.Scan returns
+		// rows.Close(). When the scan failed or found no row, that error stays,
+		// except that the error of a transaction left open on the conn
+		// (QueryRow("BEGIN")) or of a multi-result-set query joins sql.ErrNoRows,
+		// so a caller testing for either sees it.
+		cerr := rows.Close()
+		switch {
+		case cerr == nil:
+		case err == nil:
+			err = cerr
+		case errors.Is(err, sql.ErrNoRows) && (errors.Is(cerr, ErrTxLeftOpen) || cerr == errMultiResultSets):
+			err = errors.Join(err, cerr)
 		}
 	}()
 	if !rows.Next() {
