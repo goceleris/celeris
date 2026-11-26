@@ -463,6 +463,27 @@ func (p *Pool) releaseChecked(c *pgConn) error {
 	return nil
 }
 
+// releaseAfterTxEnd frees the conn of a Tx that Commit or Rollback has ended, and
+// the pool slot with it, exactly once. err is what the COMMIT or ROLLBACK returned.
+// The conn goes back to the pool only if the driver knows its state: no error, the
+// sentinel ErrTxCommitRollback (the reply was read: the server answered COMMIT with
+// ROLLBACK), or an error the server reported (an ErrorResponse, which the server
+// follows with ReadyForQuery). For those, releaseChecked still discards a conn that
+// is closed or whose last ReadyForQuery said a transaction is open or failed (a
+// FATAL, which has no ReadyForQuery, leaves the status of BEGIN). Any other error
+// (the wire failed, a read or write error, a cancelled wait) leaves the state
+// unknown: the conn is closed, not reused, and no ROLLBACK is sent to rescue it.
+func (p *Pool) releaseAfterTxEnd(c *pgConn, err error) {
+	if err != nil && !errors.Is(err, ErrTxCommitRollback) {
+		var pgErr *PGError
+		if !errors.As(err, &pgErr) {
+			p.inner.Discard(c)
+			return
+		}
+	}
+	p.release(c)
+}
+
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
 // returns the conn to the pool when closed.
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
@@ -1369,41 +1390,43 @@ type Tx struct {
 	done atomic.Bool
 }
 
-// Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire, except
-// for ErrTxCommitRollback: the server rolled the transaction back, so it is over
-// (done stays set, the conn is released) and a later Rollback returns "tx already
-// finished". After the tx is finished it returns an error that matches
-// sql.ErrTxDone. A Rollback from another goroutine that runs while the Commit is
-// still in flight also gets ErrTxDone, even if that Commit then fails; the
-// goroutine that called Commit can still Rollback after the failure.
+// Commit commits the transaction. A call to Commit ends the Tx whatever it
+// returns: every later call on it (Commit, Rollback, ExecContext, QueryContext,
+// QueryRow, Savepoint, ReleaseSavepoint, RollbackToSavepoint) returns [ErrTxDone]
+// and sends nothing, so a deferred Rollback after a failed Commit is safe, and a
+// failed Commit is not retried on the same Tx. When the error is one the server
+// reported (a *[PGError], for example a deferred constraint or a serialization
+// failure), PostgreSQL rolled the transaction back. When the connection failed on
+// the wire before the reply was read, the outcome is unknown: the transaction may
+// have been committed. The Tx is ended either way.
+//
+// The connection goes back to the pool only if the driver knows its state: the
+// server's reply was read up to ReadyForQuery and the session is idle, outside a
+// transaction. In every other case (the connection failed on the wire, the reply
+// did not arrive, ReadyForQuery reports a transaction still open or failed) it is
+// closed and replaced. The pool slot is released exactly once.
+//
+// A Commit of a transaction the server had already put in the aborted state
+// returns [ErrTxCommitRollback]: nothing was committed.
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return ErrTxDone
 	}
 	err := t.inner.Commit()
-	if errors.Is(err, ErrTxCommitRollback) {
-		// The server rolled the transaction back: it is over (done is set by the
-		// CAS above and stays), the conn is free.
-		t.pool.release(t.conn)
-		return err
-	}
-	if err != nil {
-		t.done.Store(false)
-		return err
-	}
-	t.pool.release(t.conn)
-	return nil
+	t.pool.releaseAfterTxEnd(t.conn, err)
+	return err
 }
 
-// Rollback rolls back the transaction and returns the conn to the pool. After
-// the tx is finished it returns an error that matches sql.ErrTxDone.
+// Rollback rolls back the transaction. Like [Tx.Commit] it ends the Tx whatever it
+// returns: a later call on the Tx returns [ErrTxDone], and the connection goes back
+// to the pool only if the reply was read up to ReadyForQuery with the session idle
+// (a Rollback that failed on the wire discards it).
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return ErrTxDone
 	}
 	err := t.inner.Rollback()
-	t.pool.release(t.conn)
+	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
 
