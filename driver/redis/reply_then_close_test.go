@@ -1,12 +1,17 @@
 package redis
 
-// "Full reply delivered, then the connection closed at once (no pause)": the
-// first call, whose reply was delivered whole, must report its real result
-// with a nil error. The calls after it may report the connection loss (an
-// error: the pool can hand out the closed connection until it notices), but
-// never a wrong value, a hang or a panic. Not covered: whether the pool stops
-// handing out closed connections after a bounded number of calls, and a close
-// by RST (the fake closes with a FIN).
+// A reply delivered whole and the connection closed right behind it (no
+// pause), and a null reply before a close or a drop. The event-loop path
+// (the standalone client on Linux) does not guarantee that the call whose
+// reply arrived whole reports it with a nil error: a FIN right behind the
+// reply can make the call return "file descriptor not registered" instead
+// (celeris#1460, celeris#1465, v1.6.1). So the tests here assert what every
+// path guarantees: a nil error always carries the command's own value, a
+// failure is the connection's error and never a null reply's ErrNil, and no
+// command takes another command's result. The strict variants (a delivered
+// reply reports its real result with a nil error) are in
+// reply_then_close_portable_test.go, which builds where the portable loop
+// is the path.
 
 import (
 	"bufio"
@@ -19,8 +24,10 @@ import (
 )
 
 // closeAfterReply serves GET (the key "last" closes the connection right
-// after its reply was flushed), SET, and MULTI/EXEC with one queued command
-// (EXEC's reply is flushed and the connection closed).
+// after its reply was flushed; "nil" is a null reply, "nilclose" a null reply
+// then the connection closes, "stall" no reply and the connection drops), SET,
+// and MULTI/EXEC with one queued command (EXEC's reply is flushed and the
+// connection closed).
 func closeAfterReply(t *testing.T) *fakeRedis {
 	var fp atomic.Pointer[fakeRedis]
 	closeAll := func(w *bufio.Writer) {
@@ -39,12 +46,12 @@ func closeAfterReply(t *testing.T) *fakeRedis {
 			handleHELLO(w, 3)
 		case "GET":
 			switch cmd[1] {
-			case "nil": // a null reply
+			case "nil":
 				_, _ = w.WriteString("$-1\r\n")
-			case "nilclose": // a null reply, then the connection closes
+			case "nilclose":
 				_, _ = w.WriteString("$-1\r\n")
 				closeAll(w)
-			case "stall": // no reply: the connection drops
+			case "stall":
 				closeAll(w)
 			default:
 				writeBulk(w, "val-"+cmd[1])
@@ -76,7 +83,9 @@ func newCloseAfterReplyClient(t *testing.T) *Client {
 	return c
 }
 
-func TestReplyThenCloseReportsTheRealResult(t *testing.T) {
+// TestReplyThenCloseNeverReportsAWrongResult: whatever the call reports, a
+// nil error carries the command's own value.
+func TestReplyThenCloseNeverReportsAWrongResult(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -88,15 +97,17 @@ func TestReplyThenCloseReportsTheRealResult(t *testing.T) {
 			b := p.Get("b")
 			l := p.Get("last")
 			if err := p.Exec(ctx); err != nil {
-				if i == 0 {
-					t.Fatalf("Exec of the call whose reply was delivered whole = %v, want nil", err)
+				for name, g := range map[string]*StringCmd{"a": a, "b": b, "last": l} {
+					if v, e := g.Result(); e == nil || v != "" {
+						t.Fatalf("round %d: Exec failed (%v) but %s = %q, %v", i, err, name, v, e)
+					}
 				}
 				p.Release()
 				continue
 			}
 			for name, g := range map[string]*StringCmd{"a": a, "b": b, "last": l} {
-				if v, err := g.Result(); err != nil || v != "val-"+name {
-					t.Fatalf("round %d: %s = %q, %v", i, name, v, err)
+				if v, e := g.Result(); e != nil || v != "val-"+name {
+					t.Fatalf("round %d: %s = %q, %v", i, name, v, e)
 				}
 			}
 			p.Release()
@@ -106,15 +117,8 @@ func TestReplyThenCloseReportsTheRealResult(t *testing.T) {
 	t.Run("single command", func(t *testing.T) {
 		c := newCloseAfterReplyClient(t)
 		for i := 0; i < 40; i++ {
-			v, err := c.Get(ctx, "last")
-			if err != nil {
-				if i == 0 {
-					t.Fatalf("Get of the call whose reply was delivered whole = %v, want nil", err)
-				}
-				continue
-			}
-			if v != "val-last" {
-				t.Fatalf("round %d: Get = %q", i, v)
+			if v, err := c.Get(ctx, "last"); err == nil && v != "val-last" {
+				t.Fatalf("round %d: Get = %q, nil", i, v)
 			}
 		}
 	})
@@ -123,27 +127,25 @@ func TestReplyThenCloseReportsTheRealResult(t *testing.T) {
 		c := newCloseAfterReplyClient(t)
 		for i := 0; i < 40; i++ {
 			tx, err := c.TxPipeline(ctx)
-			if err == nil {
-				s := tx.Set("k", "v", 0)
-				if err = tx.Exec(ctx); err == nil {
-					if v, e := s.Result(); e != nil || v != "OK" {
-						t.Fatalf("round %d: Set = %q, %v", i, v, e)
-					}
-					continue
-				}
+			if err != nil {
+				continue
 			}
-			if i == 0 {
-				t.Fatalf("Tx of the call whose reply was delivered whole = %v, want nil", err)
+			s := tx.Set("k", "v", 0)
+			if err := tx.Exec(ctx); err == nil {
+				if v, e := s.Result(); e != nil || v != "OK" {
+					t.Fatalf("round %d: Set = %q, %v", i, v, e)
+				}
 			}
 		}
 	})
 }
 
-// A null reply (ErrNil) is a reply, not a lost connection. All replies of the
-// batch arrive (the last one a null), then the server closes: every command
-// reports its own reply, the null one ErrNil, and no command takes another's
-// result.
-func TestReplyThenCloseWithANullReplyKeepsEachResult(t *testing.T) {
+// TestNullReplyThenCloseNeverMixesResults: all replies arrive, the last a null,
+// then the server closes. Either the batch completed (Exec reports the null
+// reply's ErrNil, every command its own result) or it failed (Exec reports a
+// connection error that is not ErrNil, and so does every command). A command
+// that got a real value never reports ErrNil.
+func TestNullReplyThenCloseNeverMixesResults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c := newCloseAfterReplyClient(t)
@@ -152,18 +154,19 @@ func TestReplyThenCloseWithANullReplyKeepsEachResult(t *testing.T) {
 		a := p.Get("aaaa")
 		m := p.Get("nilclose")
 		err := p.Exec(ctx)
-		if i > 0 && !errors.Is(err, ErrNil) {
-			p.Release() // the pool handed out the closed connection: the loss, not a result
-			continue
-		}
-		if !errors.Is(err, ErrNil) {
-			t.Fatalf("Exec = %v, want ErrNil (the null reply)", err)
-		}
-		if v, e := a.Result(); e != nil || v != "val-aaaa" {
-			t.Fatalf("round %d: aaaa = %q, %v; want val-aaaa, nil", i, v, e)
-		}
-		if v, e := m.Result(); !errors.Is(e, ErrNil) || v != "" {
-			t.Fatalf("round %d: the null reply = %q, %v; want \"\", ErrNil", i, v, e)
+		av, ae := a.Result()
+		mv, me := m.Result()
+		switch {
+		case errors.Is(err, ErrNil):
+			if ae != nil || av != "val-aaaa" || !errors.Is(me, ErrNil) || mv != "" {
+				t.Fatalf("round %d: Exec = ErrNil but aaaa = %q, %v; null = %q, %v", i, av, ae, mv, me)
+			}
+		case err != nil:
+			if ae == nil || errors.Is(ae, ErrNil) || me == nil || errors.Is(me, ErrNil) || av != "" || mv != "" {
+				t.Fatalf("round %d: Exec failed (%v) but aaaa = %q, %v; null = %q, %v", i, err, av, ae, mv, me)
+			}
+		default:
+			t.Fatalf("round %d: Exec = nil for a batch ending in a null reply", i)
 		}
 		p.Release()
 	}
