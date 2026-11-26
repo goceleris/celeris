@@ -193,6 +193,11 @@ type pgRequest struct {
 	// runtime lock chain would be corrupted by a zero-value overwrite).
 	doneMu   sync.Mutex
 	doneFlag bool
+	// abandoned is set under doneMu by a caller whose context ended while it
+	// waited for the reply (waitForQueryRows): the rows that still arrive are
+	// dropped, not buffered, so a cancel the server did not act on does not
+	// buffer the rest of the result.
+	abandoned bool
 	// doneAtom is the lockless mirror of doneFlag. The spin-wait fast path
 	// checks it without acquiring doneMu. Set to 1 by finish()/fail()
 	// immediately before signaling doneCh; reset to 0 in acquirePgRequest.
@@ -319,6 +324,7 @@ func acquirePgRequest() *pgRequest {
 	// channel. doneMu is NOT reset — its zero value is always a valid
 	// unlocked mutex, and a prior life cycle always left it unlocked.
 	r.doneFlag = false
+	r.abandoned = false
 	r.doneAtom.Store(0)
 	return r
 }
@@ -495,7 +501,7 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
 	r.doneMu.Lock()
 	defer r.doneMu.Unlock()
-	if r.doneFlag {
+	if r.doneFlag || r.abandoned {
 		return 0, false, false
 	}
 	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
@@ -2438,9 +2444,37 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
+		// The request is abandoned: nobody will read its rows. The select may
+		// take ctx.Done although colsCh is ready too (rowCh published), and a
+		// stream can be promoted after the select, while the cancel is sent.
+		// Left alone, the event-loop worker blocks in sendRow on the full rowCh,
+		// cannot read the server's cancel reply, and doneCh never fires; a
+		// worker serves every conn registered on it, so they all stall.
+		//
+		// So, before the cancel: abandoned makes the worker drop the rows that
+		// still arrive instead of buffering them (the server may not act on the
+		// cancel at once, or at all when it reaches an idle backend, and the
+		// rest of the result would pile up in req.rows), and closeRowCh releases
+		// a worker already blocked in sendRow and keeps a promotion from
+		// publishing a stream. The worker then reads on to ReadyForQuery. The
+		// rows buffered so far are dropped with the request.
+		req.doneMu.Lock()
+		req.abandoned = true
+		req.doneMu.Unlock()
+		req.closeRowCh()
 		confirmed := c.cancelRunning()
-		// A conn that cancelRunning failed completes req at once (failAll).
-		<-req.doneCh
+		// A conn that cancelRunning failed completes req at once (failAll). The
+		// wait is bounded as wait()'s is: a server that never answers the cancel
+		// fails the conn (the pool discards it) and the call returns anyway.
+		timer := time.NewTimer(cancelDrainTimeout)
+		select {
+		case <-req.doneCh:
+			timer.Stop()
+		case <-timer.C:
+			c.failAll(errors.New("celeris-postgres: cancel timeout"))
+			releasePgRequest(req)
+			return nil, ctx.Err()
+		}
 		reqErr := req.err
 		releasePgRequest(req)
 		if !confirmed {

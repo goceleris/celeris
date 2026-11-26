@@ -34,9 +34,13 @@ func buildCancelRequest(pid, secret int32) []byte {
 // pgConn.cancelRunning). A var so the tests can shorten it.
 var cancelExchangeTimeout = time.Second
 
-// cancelDrainTimeout bounds how long driveDirect waits, after a confirmed
-// cancel, for the cancelled statement's Error + ReadyForQuery. A var so the
-// tests can shorten it.
+// cancelDrainTimeout bounds how long a call waits, after a confirmed cancel,
+// for the cancelled statement's Error + ReadyForQuery: driveDirect, and the
+// ctx branch of waitForQueryRows (as wait()'s 30 s does for the other
+// statements). A call whose context ended returns, at the latest, this long
+// after the cancel exchange (the conn is then failed and discarded); with a
+// server that answers the cancel, which is what every measured call did, it
+// returns within milliseconds. A var so the tests can shorten it.
 var cancelDrainTimeout = 30 * time.Second
 
 // errCancelUnconfirmed fails a conn whose cancel exchange did not finish. It
