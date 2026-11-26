@@ -55,6 +55,13 @@ type Options struct {
 	// (Linux); 0 puts none. The Connector and the Pool set it, from the
 	// server's Config.SocketBusyPoll under WithEngine (celeris#1228).
 	busyPoll time.Duration
+	// maxResultBytes is the result buffer cap of the connection, in bytes of
+	// DataRow payload; 0 is the default (maxDirectResultBytes). WithMaxResultBytes
+	// sets it, on the Pool and on the Connector; no DSN parameter does.
+	maxResultBytes int
+	// streaming is the streaming=true DSN parameter: a Connector registers its
+	// connections on the event loop ([Connector.WithStreaming]). A Pool ignores it.
+	streaming bool
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
@@ -272,6 +279,15 @@ func applyDSNKey(d *DSN, k, v string) error {
 			return fmt.Errorf("celeris-postgres: auto_cache_statements = %q: want bool", v)
 		}
 		d.Options.autoCacheStatementsExplicit = true
+	case "streaming":
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			d.Options.streaming = true
+		case "0", "false", "off", "no":
+			d.Options.streaming = false
+		default:
+			return fmt.Errorf("celeris-postgres: streaming = %q: want bool", v)
+		}
 	case "application_name":
 		d.Options.Application = v
 	default:

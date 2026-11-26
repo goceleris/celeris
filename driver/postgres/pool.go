@@ -61,6 +61,10 @@ type options struct {
 	// engine is the server WithEngine was given, kept for its
 	// Config.SocketBusyPoll.
 	engine ServerProvider
+	// maxResultBytes is the result buffer cap WithMaxResultBytes set, and
+	// maxResultSet whether it was set (Open refuses a value below 1).
+	maxResultBytes int
+	maxResultSet   bool
 }
 
 // Option configures Open.
@@ -123,6 +127,20 @@ func WithStatementCacheSize(n int) Option { return func(o *options) { o.cfg.Stat
 
 // WithApplication sets the "application_name" startup parameter.
 func WithApplication(name string) Option { return func(o *options) { o.cfg.Application = name } }
+
+// WithMaxResultBytes sets the result buffer cap of the Pool's direct-mode
+// connections: the most DataRow payload bytes a single statement's result may
+// have, as a number of bytes. A direct-mode connection reads a reply whole into
+// memory, and a statement whose result is over the cap fails with
+// [ErrResultTooBig] (from [Rows.Err], after the rows that fit). The default is
+// 64 MiB. The cap bounds memory, so raising it is the caller's explicit choice: n
+// must be at least 1, and [Open] returns an error for a smaller value; there is no
+// way to turn the cap off. A Pool on the event loop streams its results and has no
+// cap, so the option does nothing there. [Connector.WithMaxResultBytes] is the
+// same setting for database/sql.
+func WithMaxResultBytes(n int) Option {
+	return func(o *options) { o.maxResultBytes, o.maxResultSet = n, true }
+}
 
 // WithHealthCheck sets the background sweep interval. Zero disables it.
 func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.HealthCheck = d } }
@@ -201,6 +219,12 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	o := &options{cfg: PoolConfig{DSN: dsnStr}}
 	for _, fn := range opts {
 		fn(o)
+	}
+	if o.maxResultSet {
+		if o.maxResultBytes < 1 {
+			return nil, fmt.Errorf("celeris-postgres: WithMaxResultBytes(%d): the cap must be at least 1 byte (there is no way to turn it off)", o.maxResultBytes)
+		}
+		dsn.Options.maxResultBytes = o.maxResultBytes
 	}
 	if o.cfg.Application != "" {
 		if dsn.Params == nil {

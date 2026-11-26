@@ -105,14 +105,28 @@ func openPoolEngine(dsn string, opts ...postgres.Option) (*postgres.Pool, error)
 }
 
 // openSQLEngine is sql.Open, bound to the engine of the mode (a Connector WithEngine) when there is one.
+//
+// A Connector dials direct connections by default (they are not on the engine's
+// loop: WithEngine has no effect on them), so the loop path of database/sql is
+// run with CELERIS_CONFORMANCE_STREAMING=1, which adds Connector.WithStreaming:
+// "1" with no engine mode is the driver's own loop, with an engine mode the
+// server's loop (and, on a started epoll or io_uring server, whatever the rule
+// of the Connector decides).
 func openSQLEngine(dsn string) (*sql.DB, error) {
 	sp := engineProvider()
-	if sp == nil {
+	streaming := os.Getenv("CELERIS_CONFORMANCE_STREAMING") == "1"
+	if sp == nil && !streaming {
 		return sql.Open(driverName, dsn)
 	}
 	c, err := postgres.NewConnector(dsn)
 	if err != nil {
 		return nil, err
 	}
-	return sql.OpenDB(c.WithEngine(sp)), nil
+	if sp != nil {
+		c = c.WithEngine(sp)
+	}
+	if streaming {
+		c = c.WithStreaming()
+	}
+	return sql.OpenDB(c), nil
 }

@@ -13,9 +13,11 @@ import (
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
-// celeris#1228: see the redis driver's test of the same name. The Connector is
-// the entry point that registers connections on the engine's loop: a Pool on a
-// native engine dials through Go's netpoll and sets no socket option.
+// celeris#1228: see the redis driver's test of the same name. A Connector with
+// WithStreaming is the entry point that registers connections on the engine's
+// loop (a Connector without it dials direct connections, see
+// busy_poll_direct_default_linux_test.go): a Pool on a native engine dials
+// through Go's netpoll and sets no socket option.
 func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 	base := sockoptstest.Baseline(t)
 	for _, tc := range []struct {
@@ -36,7 +38,7 @@ func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("connector: %v", err)
 			}
-			cn = cn.WithEngine(srv)
+			cn = cn.WithEngine(srv).WithStreaming()
 			defer func() { _ = cn.Close() }()
 			dc, err := cn.Connect(context.Background())
 			if err != nil {
@@ -90,7 +92,7 @@ func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := busypolltest.StartServer(t, tc.d)
-			cn := newFakePGConnector(t).WithEngine(srv)
+			cn := newFakePGConnector(t).WithStreaming().WithEngine(srv)
 			t.Cleanup(func() { _ = cn.Close() })
 			calls := recordSetsockopt(t)
 			connectorSocket(t, cn)
@@ -137,7 +139,7 @@ func TestConnectorSocketBusyPollOption(t *testing.T) {
 		}, 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cn := tc.build(newFakePGConnector(t))
+			cn := tc.build(newFakePGConnector(t).WithStreaming())
 			t.Cleanup(func() { _ = cn.Close() })
 			c := connectorSocket(t, cn)
 			if got := busypolltest.BusyPoll(t, c.fd); got != tc.want {

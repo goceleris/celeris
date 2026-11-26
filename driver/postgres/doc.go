@@ -16,12 +16,19 @@
 // [Open] accepts both the libpq URL form and the key=value DSN form. Pool
 // behavior is tuned with functional [Option] values: [WithEngine],
 // [WithMaxOpen], [WithMaxIdlePerWorker], [WithMaxLifetime], [WithMaxIdleTime],
-// [WithHealthCheck], [WithStatementCacheSize], and [WithApplication].
+// [WithHealthCheck], [WithStatementCacheSize], [WithMaxResultBytes] and
+// [WithApplication].
 // [WithEngine] is optional. When set on a server that has not started yet, the
 // pool shares the HTTP server's event loop instead of resolving a standalone
 // one; a bare [Open] and [WithEngine] on a server that has started or runs
-// async handlers give a direct-mode pool, whose results are capped at 64 MiB
-// (see [ErrResultTooBig]: always check [Rows.Err]).
+// async handlers give a direct-mode pool, whose results are capped at 64 MiB by
+// default (see [ErrResultTooBig]: always check [Rows.Err]).
+//
+// database/sql connections are direct too, by default: sql.Open and a [Connector]
+// read each reply whole on the calling goroutine, with the same cap
+// ([Connector.WithMaxResultBytes]). [Connector.WithStreaming], or streaming=true in
+// the DSN, puts them on the event loop, which streams a result and has no cap, at
+// the cost of the limits its godoc lists.
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
