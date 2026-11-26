@@ -350,6 +350,7 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		}
 		req = head.(*redisRequest)
 	}
+	dispatchHook() // test hook: a no-op unless built with -tags redis_delay_hook
 	if v.Type == protocol.TyError || v.Type == protocol.TyBlobErr {
 		req.resultErr = parseError(v.Str)
 		req.expect = expectNone
