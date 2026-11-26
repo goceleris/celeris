@@ -29,6 +29,21 @@ go test -run=^$ -bench=BenchmarkSelectOne -count=10 ./... > results.txt
 benchstat -filter ".name:/(BenchmarkSelectOne_(Celeris|Pgx))/" results.txt
 ```
 
+## Round-trip against the reference drivers
+
+`roundtrip_ref_test.go` is not a benchmark: it reads the common column types
+through celeris-postgres, pgx/v5 (its `database/sql` adapter) and lib/pq, in the
+simple and the extended protocol, and requires the three to return the same
+value. The Driver Conformance job of `ci.yml` runs it. It is the reference
+half of `test/conformance/postgres/roundtrip_types_test.go`, whose expectations
+are literals.
+
+```sh
+CELERIS_PG_DSN=... go test -run '^TestRoundTripAgainstReferenceDrivers$' -v .
+# also the cells where celeris is known to be wrong today:
+CELERIS_PG_DSN=... go test -tags pgrtbugs -run '^TestRoundTripAgainstReferenceDrivers$' -v .
+```
+
 ## Exit criteria
 
 These thresholds are *documentation*, not enforced in the benchmark code

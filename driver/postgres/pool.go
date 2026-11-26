@@ -801,7 +801,10 @@ func (r *Rows) Scan(dest ...any) error {
 }
 
 // Err returns the first non-EOF error encountered during iteration. It is still
-// that error after Close.
+// that error after Close. Always check it after the loop: on a direct-mode Pool
+// it is the only place that reports [ErrResultTooBig] (Next just returns false
+// and Close returns nil), and a server error that arrives after some rows is
+// reported here too.
 func (r *Rows) Err() error {
 	r.closemu.RLock()
 	defer r.closemu.RUnlock()

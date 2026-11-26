@@ -2780,6 +2780,24 @@ jobs:
             echo "expected no SKIP line -- a skip is not coverage"
             exit 1
           fi
+      # The same common column types read back through celeris-postgres, pgx/v5
+      # and lib/pq, in the simple and the extended protocol, and required to
+      # agree (test/drivercmp/postgres/roundtrip_ref_test.go). That module is
+      # separate so pgx and lib/pq never reach consumers of celeris; it takes the
+      # local celeris through a replace directive, so this run tests this commit.
+      - name: Postgres round-trip against pgx and lib/pq (reference drivers)
+        shell: bash
+        working-directory: test/drivercmp/postgres
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=300s -v -run '^TestRoundTripAgainstReferenceDrivers$' ./... 2>&1 | tee /tmp/drv-pgref.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pgref.log)
+          echo "Postgres reference-driver round-trip: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pgref.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
       # The three authentication tests (TestAuth_PasswordSuccess,
       # TestAuth_PasswordFailure, TestAuth_ForceRESP2WithPassword) need a server
       # that requires a password, and the redis service above has none, so they
