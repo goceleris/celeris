@@ -147,8 +147,7 @@ func rtSupportHelperRows() []supporttable.Row {
 					}
 					for _, bh := range rtBugHelpers(piece) {
 						if bh == h.name {
-							// A helper can be hit by two notes (R1 and R2 on DoSlice of a map);
-							// both are recorded below.
+							// A helper can be hit by two notes; both are recorded below.
 							col.Cell(h.name, p.scope, strings.Fields(piece)[0])
 							gap = "recorded"
 						}
@@ -204,11 +203,6 @@ func rtSupportBehaviourRows() []supporttable.Row {
 // TestSupportTable fails for an entry no row refers to, so drop an entry when its
 // classification leaves the matrix.
 var rtGaps = []supporttable.Gap{
-	{ID: "R1", Release: supporttable.V160,
-		Summary: "On RESP3 (the default), `DoString` and `DoInt` fail on a double, boolean or big number reply, and `DoSlice` fails on a map reply, where RESP2 returns the value.",
-		Error:   "celeris-redis: expected string reply, got double"},
-	{ID: "R2", Release: supporttable.V160,
-		Summary: "`DoSlice` returns an empty string for every element that is an integer, a double, a boolean or a nested array."},
 	{ID: "R3", Release: supporttable.V160,
 		Summary: "On Linux, a single value of 4 MiB or more cannot be written (`SET`, `RPUSH`, `HSET` and the other commands that carry one large argument). macOS and Windows do not have this limit.",
 		Error:   "celeris/engine: worker write queue full"},
