@@ -2758,6 +2758,8 @@ jobs:
             TestFirstRequestAfterIdleIsNotStalled1381
             TestIdleShutdownIsPrompt1381
             TestIdleWaitOfAWorkerThatHoldsNothing1381
+            TestDriverRegistrationReachesAnIdleWorker1381
+            TestAdoptedConnectionReachesAnIdleWorker1381
           )
           server=(TestIdleServerFirstRequestAndShutdown1381)
           integration=(TestSlowlorisSynthetic TestSlowlorisSyntheticConcurrent)
