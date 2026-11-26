@@ -543,6 +543,22 @@ func (r *pgRequest) setColumnsIfLive(cols []protocol.ColumnDesc) {
 	}
 }
 
+// dropBufferedRows discards the rows buffered so far, unless the request is
+// done (see setColumnsIfLive): a failAll that completed it woke its caller,
+// who reads r.rows now. Dispatch runs it for a buffered request that is about
+// to fail with errMultiResultSets, whose caller must get the error and no rows.
+func (r *pgRequest) dropBufferedRows() {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return
+	}
+	for i := range r.rows {
+		r.rows[i] = nil
+	}
+	r.rows = r.rows[:0]
+}
+
 // setResultIfLive stores the extended query's command tag and, when none is set
 // yet, its columns, unless the request is done (see setColumnsIfLive).
 func (r *pgRequest) setResultIfLive(tag string, cols []protocol.ColumnDesc) {
@@ -1628,6 +1644,18 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// closure-pair allocation the previous inline funcs paid (-2
 		// allocs/op on the hot path; see PR description for full delta).
 		done, err := head.simple.Handle(msgType, payload, head)
+		if done && err == nil && head.simple.MultiSet {
+			// More than one statement returned rows. The whole reply has been
+			// read, up to this ReadyForQuery, so the conn is clean for the next
+			// query. A server error from one of the statements, if there was
+			// one, is err already and is reported as it always was.
+			err = errMultiResultSets
+			if head.rowCh == nil {
+				// Buffered: the caller gets the error and no rows, not the first
+				// set as if it were the answer.
+				head.dropBufferedRows()
+			}
+		}
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
@@ -2283,6 +2311,11 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
+	// A query that returns rows returns one result set: a second RowDescription
+	// is not parsed (it would rewrite the columns the caller holds) and the
+	// request fails at ReadyForQuery with errMultiResultSets. Exec leaves it
+	// off and keeps accepting any number of statements.
+	req.simple.RejectMultiSet = true
 	// Lazy streaming: colsCh fires when promoteToStreaming activates
 	// rowCh mid-dispatch, letting the caller goroutine switch to
 	// streaming mode instead of waiting for the full result set.
@@ -2417,6 +2450,14 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		case <-req.doneCh:
 		default:
 		}
+		if req.err == errMultiResultSets && req.rowCh != nil {
+			// The first set streamed and the whole reply, the error included,
+			// arrived before this select ran (a set of exactly streamThreshold
+			// rows): colsCh and doneCh are both ready and the select may pick
+			// this one. The rows are in rowCh, which is closed: deliver them
+			// and the error after them, as the colsCh branch does.
+			return drainStreamToPGRows(req, textFormat, req.err), nil
+		}
 		if req.err != nil {
 			// If rows were buffered before the error arrived (e.g.
 			// mid-stream ErrorResponse), return them with the error
@@ -2433,7 +2474,7 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		if req.rowCh != nil {
 			// Streaming was activated and the request completed before we
 			// entered this select. The rowCh is closed; drain it into pgRows.
-			return drainStreamToPGRows(req, textFormat), nil
+			return drainStreamToPGRows(req, textFormat, nil), nil
 		}
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
@@ -2457,12 +2498,12 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 // into a buffered pgRows. Used by the sync fast path when the entire response
 // completed during WriteAndPoll — avoids the per-Next channel recv overhead
 // for small result sets.
-func drainStreamToPGRows(req *pgRequest, textFormat bool) *pgRows {
+func drainStreamToPGRows(req *pgRequest, textFormat bool, deferredErr error) *pgRows {
 	var rows [][][]byte
 	for row := range req.rowCh {
 		rows = append(rows, row)
 	}
-	return acquirePGRows(req.columns, rows, textFormat, req, nil)
+	return acquirePGRows(req.columns, rows, textFormat, req, deferredErr)
 }
 
 // simpleExec returns the command tag and rows-affected count. Callers may
