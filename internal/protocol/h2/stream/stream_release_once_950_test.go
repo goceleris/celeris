@@ -39,6 +39,31 @@ func openPoolStream(t *testing.T, p *Processor, id uint32) *Stream {
 	return s
 }
 
+// skipPoolScan950 is a test hook: TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950
+// sets it so that the once test's scan of the second manager never finds its
+// stream, and the fallback that follows the scan runs on every iteration. It
+// is false in every other test.
+var skipPoolScan950 bool
+
+// poolDuplicates950 takes n objects out of the stream pool and counts the
+// streams that came out more than once: a stream put into the pool twice. The
+// objects are not put back. A Get that finds the pool empty makes a new
+// Stream, so those never count. It reads the pool of the current P and what
+// it can steal from the others; an object in another P's private slot is not
+// seen, so it can miss a duplicate but never reports one that is not there.
+func poolDuplicates950(n int) (dups int) {
+	seen := make(map[*Stream]int, n)
+	for range n {
+		seen[streamPool.Get().(*Stream)]++
+	}
+	for _, c := range seen {
+		if c > 1 {
+			dups++
+		}
+	}
+	return dups
+}
+
 // TestRSTAtPoolHandlerEndReleasesItsStreamOnce950 drives the interleaving
 // that released a stream twice, deterministically, for a RST_STREAM from the
 // peer (handleRSTStream) and for one the server sends (a stream error:
@@ -65,9 +90,9 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fromPool, ran := 0, 0
+			fromPool, ran, injectedN := 0, 0, 0
 			defer func() {
-				t.Logf("the other connection's stream took the object from the pool in %d of %d iterations (the others hand it over directly)", fromPool, ran)
+				t.Logf("the other connection's stream took the object from the pool in %d of %d iterations; the scan missed it and the fallback injected it in %d", fromPool, ran, injectedN)
 			}()
 			for i := range 20 {
 				ran++
@@ -101,7 +126,7 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 				// NewStream would hand it over.
 				m2 := NewManager()
 				next, nextID := (*Stream)(nil), uint32(0)
-				for id := uint32(7); id < 7+2*64; id += 2 {
+				for id := uint32(7); id < 7+2*64 && !skipPoolScan950; id += 2 {
 					x, ok := m2.TryOpenStream(id)
 					if !ok {
 						break
@@ -114,6 +139,7 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 				}
 				injected := next == nil
 				if injected {
+					injectedN++
 					nextID = 1001
 					s.ID = nextID
 					s.manager = m2
@@ -156,6 +182,31 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 	}
 }
 
+// TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950 forces the once test's
+// fallback on every iteration (the scan is skipped) and then counts what is
+// in the stream pool: the stream the once test released must be there once,
+// not twice. Before the fallback stopped handing its stream to the second
+// manager's Close, every iteration left the stream in the pool twice, and the
+// next test that drained the pool, TestRSTRacesPoolHandlerEnd950, failed with
+// "released twice" (celeris#1468). One P, so the puts and the drain are on
+// the same P; the race detector drops a quarter of the puts at random, so 20
+// iterations leave a duplicate with a probability very close to 1 in either
+// build.
+func TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	poolDuplicates950(1024) // start from a pool another test did not leave a duplicate in
+	skipPoolScan950 = true
+	t.Cleanup(func() { skipPoolScan950 = false })
+	TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t)
+	skipPoolScan950 = false
+	if t.Failed() {
+		return
+	}
+	if d := poolDuplicates950(1024); d > 0 {
+		t.Fatalf("%d stream(s) of the once test are in the stream pool more than once after its fallback ran: it released a stream it had only injected into the second manager", d)
+	}
+}
+
 // TestRSTRacesPoolHandlerEnd950 runs the real executeHandler against a reset
 // of its stream (the peer's RST_STREAM, and a RST the server sends) many
 // times, and then drains the stream pool: a stream released twice comes out
@@ -167,6 +218,12 @@ func TestRSTRacesPoolHandlerEnd950(t *testing.T) {
 	n := 20000
 	if testing.Short() {
 		n = 2000
+	}
+	// A stream that is in the stream pool twice before the first reset is a
+	// leftover from another test, not a release this test made. Say so here,
+	// so that a "released twice" below is only ever this test's own release.
+	if d := poolDuplicates950(256); d > 0 {
+		t.Fatalf("a duplicate was in the stream pool before this test ran (%d stream(s) present more than once): a leftover from another test, not a release under test", d)
 	}
 	for _, tc := range []struct {
 		name  string
