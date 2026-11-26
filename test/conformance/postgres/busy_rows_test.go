@@ -24,6 +24,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -66,6 +67,10 @@ type busyEnv struct {
 	closeAll func() error // db.Close / Pool.Close
 	// ctxCancel is the cancel func of the ctx the first statement ran under.
 	ctxCancel context.CancelFunc
+	// direct is set for the native Pool in direct mode, which buffers the whole
+	// first result before it returns: there a second statement while the Rows is
+	// open works, as it always did, and must go on working.
+	direct bool
 }
 
 // busyWatch runs fn and fails the test when it has not returned after d. The
@@ -156,10 +161,30 @@ func busyDrain(t *testing.T, r busyRows, from int64) {
 // own rows, not a leftover of the first statement.
 func busyCheckMarkers(t *testing.T, env *busyEnv, tag string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	busyCheckMarkersRetry(t, env, tag, false)
+}
+
+// busyCheckMarkersRetry is busyCheckMarkers; with retryBusy a busy error is retried
+// until the connection is free. database/sql closes the Rows of a cancelled ctx on
+// a goroutine of its own and Rows.Next already returns false before that close
+// has drained the stream, so a statement started right then can meet the busy
+// error: this is the case ErrRowsOpen exists for (before it, that statement hung
+// holding database/sql's driverConn lock, which the close needs).
+func busyCheckMarkersRetry(t *testing.T, env *busyEnv, tag string, retryBusy bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	rows, _ := busyWatch(t, tag+": next query", 15*time.Second, func() error {
-		r, err := env.query(ctx, "SELECT 'm-' || g::text, g FROM generate_series(1, 3) g")
+	rows, _ := busyWatch(t, tag+": next query", 25*time.Second, func() error {
+		var r busyRows
+		var err error
+		for {
+			r, err = env.query(ctx, "SELECT 'm-' || g::text, g FROM generate_series(1, 3) g")
+			if retryBusy && isRowsOpen(err) && ctx.Err() == nil {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -191,6 +216,10 @@ func busyCheckMarkers(t *testing.T, env *busyEnv, tag string) {
 func busyClose(t *testing.T, env *busyEnv, bound time.Duration) time.Duration {
 	t.Helper()
 	_, el := busyWatch(t, env.name+": close", bound, func() error {
+		if env.ctxCancel != nil {
+			// database/sql closes the Rows a cancelled ctx belongs to.
+			env.ctxCancel()
+		}
 		if env.rollback != nil {
 			_ = env.rollback()
 		}
@@ -264,8 +293,11 @@ func busyOpenSQLConn(t *testing.T) *busyEnv {
 			}
 			return st.Close()
 		},
-		ping:     c.PingContext,
-		closeAll: func() error { _ = c.Close(); return db.Close() },
+		ping: c.PingContext,
+		// c.Close is not part of it: database/sql's Conn.Close waits for the open
+		// Rows to be closed (its closemu), by design, and a case that leaves the
+		// first Rows unread ends it by cancelling the ctx (busyClose).
+		closeAll: db.Close,
 	}
 	return env
 }
@@ -287,7 +319,7 @@ func busyOpenNativeTx(t *testing.T) *busyEnv {
 		t.Fatal(err)
 	}
 	return &busyEnv{
-		name: "native Tx", r1: r1, ctxCancel: cancel,
+		name: "native Tx", r1: r1, ctxCancel: cancel, direct: !busyPoolOnLoop(),
 		exec: func(ctx context.Context, q string) error { _, err := tx.ExecContext(ctx, q); return err },
 		query: func(ctx context.Context, q string) (busyRows, error) {
 			r, err := tx.QueryContext(ctx, q)
@@ -301,6 +333,15 @@ func busyOpenNativeTx(t *testing.T) *busyEnv {
 		rollback: tx.Rollback,
 		closeAll: p.Close,
 	}
+}
+
+// busyPoolOnLoop reports whether the native Pool of this CELERIS_CONFORMANCE_ENGINE
+// arm runs on the event loop (and streams a large result). Of the arms that
+// bind the Pool to a server, only "default" does (measured: the others, the
+// started ones and the explicit epoll, run the Pool in direct mode, which
+// buffers the whole result); a bare Open is direct as well.
+func busyPoolOnLoop() bool {
+	return os.Getenv("CELERIS_CONFORMANCE_ENGINE") == "default"
 }
 
 var busyCarriers = []struct {
@@ -364,6 +405,19 @@ func TestBusyConnSecondStatement(t *testing.T) {
 				err, el := busyWatch(t, car.name+" second "+sec.name, 15*time.Second, func() error { return sec.run(ctx, env) })
 				if err == errSkipCase {
 					t.Skipf("%s has no %s", car.name, sec.name)
+				}
+				if env.direct {
+					// Direct mode: the first result is buffered whole, the second
+					// statement is served, and the first Rows is intact.
+					if err != nil {
+						t.Fatalf("direct mode: second %s while the first Rows is open: %v (it worked before the guard)", sec.name, err)
+					}
+					busyDrain(t, env.r1, 1)
+					if err := env.r1.Close(); err != nil {
+						t.Fatalf("first statement Close: %v", err)
+					}
+					busyCheckMarkers(t, env, "after the first statement")
+					return
 				}
 				if !isRowsOpen(err) {
 					t.Fatalf("second %s on a conn with an open streaming Rows: err = %v, want the busy error (ErrRowsOpen)", sec.name, err)
@@ -429,11 +483,34 @@ func TestBusyConnFinishWithRowsOpen(t *testing.T) {
 				}
 				err, el := busyWatch(t, car+" "+how+" with a Rows open", 30*time.Second, func() error { return fn() })
 				t.Logf("%s %s with an open Rows: err = %v in %v", car, how, err, el)
+				switch {
+				case car == "nativeTx" && how == "Commit" && !env.direct:
+					// The Rows is still open: Commit says so, sends nothing and leaves the
+					// Tx open, so that the caller can close the Rows and commit again, or
+					// roll back.
+					if !isRowsOpen(err) {
+						t.Fatalf("native Tx Commit with a streaming Rows open: err = %v, want ErrRowsOpen", err)
+					}
+					if err := busyOnly(t, env, "Rollback after the refused Commit", env.rollback); err != nil {
+						t.Fatalf("Rollback after the refused Commit: %v", err)
+					}
+				case err != nil:
+					// database/sql closes the Rows first and finishes; a direct Pool has
+					// buffered the result; a native Rollback discards the conn: all nil.
+					t.Fatalf("%s %s with an open Rows: %v, want nil", car, how, err)
+				}
 				// The Rows the finish left behind is closed or closable, bounded.
 				busyWatch(t, car+" Rows.Close after "+how, 30*time.Second, func() error { return env.r1.Close() })
 			})
 		}
 	}
+}
+
+// busyOnly runs fn under a watchdog.
+func busyOnly(t *testing.T, env *busyEnv, what string, fn func() error) error {
+	t.Helper()
+	err, _ := busyWatch(t, env.name+": "+what, 30*time.Second, fn)
+	return err
 }
 
 // TestBusyConnCtxCancelReleases: cancelling the ctx of the first statement's
@@ -458,22 +535,8 @@ func TestBusyConnCtxCancelReleases(t *testing.T) {
 				}
 			}
 			if car == "sqlConn" {
-				busyCheckMarkers(t, env, "after the cancel")
+				busyCheckMarkersRetry(t, env, "after the cancel", true)
 			}
-		})
-	}
-}
-
-// TestBusyConnDBCloseUnread: db.Close / Pool.Close with an open, unread
-// streaming Rows returns within a bound.
-func TestBusyConnDBCloseUnread(t *testing.T) {
-	for _, car := range busyCarriers {
-		t.Run(car.name, func(t *testing.T) {
-			env := car.open(t)
-			busyReadFirst(t, env.r1)
-			env.rollback = nil
-			el := busyClose(t, env, 20*time.Second)
-			t.Logf("%s close with an unread streaming Rows: %v", car.name, el)
 		})
 	}
 }

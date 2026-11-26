@@ -1379,7 +1379,9 @@ func (txDoneError) Unwrap() error { return sql.ErrTxDone }
 
 var errTxDone error = txDoneError{}
 
-// Commit commits the transaction and returns the conn to the pool.
+// Commit commits the transaction and returns the conn to the pool. A Rows of the
+// Tx that is still streaming (see [ErrRowsOpen]) makes it fail with that error
+// before anything is sent: close the Rows, or read it to the end, and Commit again.
 // On failure, done is left false so a deferred Rollback can still fire, except
 // for ErrTxCommitRollback: the server rolled the transaction back, so it is over
 // (done stays set, the conn is released) and a later Rollback returns "tx already
@@ -1408,11 +1410,20 @@ func (t *Tx) Commit() error {
 
 // Rollback rolls back the transaction and returns the conn to the pool. After
 // the tx is finished it returns an error that matches sql.ErrTxDone.
+//
+// A Rows of the Tx that is still streaming (see [ErrRowsOpen]) does not stop it:
+// the conn is discarded instead of rolled back in line, the server rolls the
+// transaction back when the connection ends, and Rollback returns nil. The open
+// Rows ends with an error. Close the Rows first to keep the conn.
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return errTxDone
 	}
 	err := t.inner.Rollback()
+	if errors.Is(err, ErrRowsOpen) {
+		t.pool.inner.Discard(t.conn)
+		return nil
+	}
 	t.pool.release(t.conn)
 	return err
 }
