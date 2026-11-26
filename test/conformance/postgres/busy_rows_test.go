@@ -333,15 +333,20 @@ func busyPoolOnLoop() bool {
 }
 
 // busySQLDirect reports whether the database/sql connections of this arm are
-// direct (Go's netpoll, the mode of a Pool on a started server): a Connector bound
-// to a STARTED server runs direct (celeris#1445: a connection opened on the loop
-// of an inline handler would wait for its startup reply on the worker that has to
-// read it). Direct buffers the whole result, so there is no streaming Rows and no
-// ErrRowsOpen: the second statement is served and the first Rows stays intact,
-// as for the native Pool in direct mode. The other arms (none, default, epoll: the
-// server is not started when the Connector is bound) stay on the driver's own
-// loop.
+// direct (Go's netpoll, the mode of a Pool on a started server). Since v1.6.0 a
+// Connector dials direct connections unless it has WithStreaming
+// (CELERIS_CONFORMANCE_STREAMING=1 in this suite), and a WithStreaming Connector
+// bound to a STARTED server runs direct as well (celeris#1445: a connection opened
+// on the loop of an inline handler would wait for its startup reply on the worker
+// that has to read it). Direct buffers the whole result, so there is no streaming
+// Rows and no ErrRowsOpen: the second statement is served and the first Rows stays
+// intact, as for the native Pool in direct mode. The other arms with streaming (none,
+// default, epoll: the server is not started when the Connector is bound) stay on
+// the driver's own loop and give the busy error.
 func busySQLDirect() bool {
+	if os.Getenv("CELERIS_CONFORMANCE_STREAMING") != "1" {
+		return true
+	}
 	switch os.Getenv("CELERIS_CONFORMANCE_ENGINE") {
 	case "default-started", "default-ready", "epoll-started", "epoll-ready":
 		return true
