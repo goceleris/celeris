@@ -1303,7 +1303,11 @@ type Row struct {
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
 // is closed automatically, and a second Scan (the rows are gone) returns
-// sql.ErrNoRows too.
+// sql.ErrNoRows too. The row is returned only when the statement ended: a
+// connection lost after the row and before the statement's ReadyForQuery (an
+// INSERT ... RETURNING in autocommit commits at Sync, after the DataRow) makes
+// Scan return that error, as database/sql's Row.Scan does, and never
+// sql.ErrNoRows.
 func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
@@ -1314,18 +1318,20 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	r.rows = nil
 	defer func() {
-		// Only the error of a transaction left open on the conn is the
-		// caller's, and only when the scan went well or found no row; any other
-		// error of Close or of the scan is left as it was.
-		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
-			switch {
-			case err == nil:
-				err = cerr
-			case errors.Is(err, sql.ErrNoRows):
-				// A statement that returns no row (QueryRow("BEGIN")): both
-				// are true, so a caller testing for either sees it.
-				err = errors.Join(err, cerr)
-			}
+		// The row is the answer only when the statement ended: a Close error
+		// (a connection lost before the ReadyForQuery, a server error that
+		// came after the row) is Scan's error when the scan itself went well,
+		// as database/sql's Row.Scan returns rows.Close(). When the scan failed
+		// or found no row, that error stays, except that the error of a
+		// transaction left open on the conn (QueryRow("BEGIN")) joins
+		// sql.ErrNoRows, so a caller testing for either sees it.
+		cerr := rows.Close()
+		switch {
+		case cerr == nil:
+		case err == nil:
+			err = cerr
+		case errors.Is(err, sql.ErrNoRows) && errors.Is(cerr, ErrTxLeftOpen):
+			err = errors.Join(err, cerr)
 		}
 	}()
 	if !rows.Next() {

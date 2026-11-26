@@ -119,6 +119,26 @@ type queryRowCarrier struct {
 
 func queryRowCarriers() []queryRowCarrier {
 	return []queryRowCarrier{
+		{"poolQueryRow", true, func(t *testing.T, addr string, direct, ext bool) (int64, error) {
+			p := lossPool(t, addr, direct)
+			q, args := lossQuery(false, ext)
+			var v int64
+			err := p.QueryRow(tctx(t), q, args...).Scan(&v)
+			return v, err
+		}},
+		{"poolTxQueryRow", true, func(t *testing.T, addr string, direct, ext bool) (int64, error) {
+			p := lossPool(t, addr, direct)
+			q, args := lossQuery(false, ext)
+			ctx := tctx(t)
+			tx, err := p.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback() }()
+			var v int64
+			err = tx.QueryRow(ctx, q, args...).Scan(&v)
+			return v, err
+		}},
 		{"sqlDB", false, func(t *testing.T, addr string, _, ext bool) (int64, error) {
 			db := lossSQL(t, addr)
 			q, args := lossQuery(false, ext)
@@ -162,26 +182,31 @@ func queryRowCarriers() []queryRowCarrier {
 // the row, and never sql.ErrNoRows.
 func TestConnLossQueryRowIsNotSuccess(t *testing.T) {
 	for _, carrier := range queryRowCarriers() {
-		for _, ext := range []bool{false, true} {
-			for _, n := range []int{1, 50, 500} {
-				for _, kind := range allLossKinds {
-					cfg := lossCfg{kind: kind, n: n}
-					name := fmt.Sprintf("%s/loop/ext=%v/rows%d/%s", carrier.name, ext, n, kind)
-					t.Run(name, func(t *testing.T) {
-						t.Parallel()
-						addr := startFakePG(t, lossServer(t, cfg))
-						v, err := carrier.run(t, addr, false, ext)
-						if kind == lossComplete {
-							if err != nil || v != 1 {
-								t.Errorf("Scan after a complete result: v=%d err=%v", v, err)
+		for _, engine := range []string{"loop", "direct"} {
+			if engine == "direct" && !carrier.directOK {
+				continue
+			}
+			for _, ext := range []bool{false, true} {
+				for _, n := range []int{1, 50, 500} {
+					for _, kind := range allLossKinds {
+						cfg := lossCfg{kind: kind, n: n}
+						name := fmt.Sprintf("%s/%s/ext=%v/rows%d/%s", carrier.name, engine, ext, n, kind)
+						t.Run(name, func(t *testing.T) {
+							t.Parallel()
+							addr := startFakePG(t, lossServer(t, cfg))
+							v, err := carrier.run(t, addr, engine == "direct", ext)
+							if kind == lossComplete {
+								if err != nil || v != 1 {
+									t.Errorf("Scan after a complete result: v=%d err=%v", v, err)
+								}
+								return
 							}
-							return
-						}
-						if err == nil {
-							t.Fatalf("Scan returned the row (v=%d) with a nil error, but the statement was cut off (%s)", v, kind)
-						}
-						checkLoss(t, cfg, 0, err)
-					})
+							if err == nil {
+								t.Fatalf("Scan returned the row (v=%d) with a nil error, but the statement was cut off (%s)", v, kind)
+							}
+							checkLoss(t, cfg, 0, err)
+						})
+					}
 				}
 			}
 		}
