@@ -167,6 +167,11 @@ func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
 // These are tracked in goceleris/celeris#1436, which also says what is decided
 // about them. A program that cannot meet them should not use WithStreaming.
 //
+// LISTEN and UNLISTEN are accepted on this path, but notifications are not
+// delivered: the driver has no way to receive them (the behaviour of v1.5.11), and
+// a direct connection refuses the statement for that reason
+// ([ErrDirectModeUnsupported]).
+//
 // Busy polling applies to this path only: [Connector.WithSocketBusyPoll], and the
 // server's Config.SocketBusyPoll through [Connector.WithEngine], set SO_BUSY_POLL
 // on the connections WithStreaming registers on the loop, and on no direct one.
