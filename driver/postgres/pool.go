@@ -1369,16 +1369,6 @@ type Tx struct {
 	done atomic.Bool
 }
 
-// txDoneError is returned by a Tx used after Commit or Rollback. It keeps the
-// message the driver always had and matches sql.ErrTxDone with errors.Is, as
-// code written against database/sql expects.
-type txDoneError struct{}
-
-func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
-func (txDoneError) Unwrap() error { return sql.ErrTxDone }
-
-var errTxDone error = txDoneError{}
-
 // Commit commits the transaction and returns the conn to the pool.
 // On failure, done is left false so a deferred Rollback can still fire, except
 // for ErrTxCommitRollback: the server rolled the transaction back, so it is over
@@ -1389,7 +1379,7 @@ var errTxDone error = txDoneError{}
 // goroutine that called Commit can still Rollback after the failure.
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Commit()
 	if errors.Is(err, ErrTxCommitRollback) {
@@ -1410,7 +1400,7 @@ func (t *Tx) Commit() error {
 // the tx is finished it returns an error that matches sql.ErrTxDone.
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Rollback()
 	t.pool.release(t.conn)
@@ -1420,7 +1410,7 @@ func (t *Tx) Rollback() error {
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	if t.done.Load() {
-		return Result{}, errTxDone
+		return Result{}, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
@@ -1436,7 +1426,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 // closed before Commit/Rollback.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if t.done.Load() {
-		return nil, errTxDone
+		return nil, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
@@ -1460,7 +1450,7 @@ func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 // avoid SQL-injection.
 func (t *Tx) Savepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.Savepoint(ctx, name)
 }
@@ -1469,7 +1459,7 @@ func (t *Tx) Savepoint(ctx context.Context, name string) error {
 // Savepoint.
 func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.ReleaseSavepoint(ctx, name)
 }
@@ -1478,7 +1468,7 @@ func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 // as Savepoint.
 func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
 }

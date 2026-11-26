@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"errors"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
@@ -27,6 +28,18 @@ var ErrClosed = errors.New("celeris-postgres: connection closed")
 // again. It matches with errors.Is, also through database/sql, whose Tx.Commit
 // returns the driver's error as it is.
 var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resulted in rollback")
+
+// ErrTxDone is returned by every method of a [Tx] after Commit or Rollback has
+// been called on it, whatever that call returned (a Commit that failed ends the
+// Tx too). Nothing is sent to the server. It keeps the message the driver always
+// had and matches [database/sql.ErrTxDone] with errors.Is, as code written against
+// database/sql expects.
+var ErrTxDone error = txDoneError{}
+
+type txDoneError struct{}
+
+func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
+func (txDoneError) Unwrap() error { return sql.ErrTxDone }
 
 // ErrBadConn is returned when a connection is in an unusable state; returning
 // it causes database/sql to evict the conn and open a fresh one.
