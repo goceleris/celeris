@@ -176,6 +176,9 @@ func TestSimpleQueryUnexpectedMessageFailsConn(t *testing.T) {
 				if tc.want == dsCopyWant && !strings.Contains(err.Error(), "CopyFrom") {
 					t.Fatalf("err = %q does not name CopyFrom", err)
 				}
+				if tc.want == dsCopyWant && !errors.Is(err, ErrClosed) {
+					t.Fatalf("err = %q does not match ErrClosed", err)
+				}
 				dsAssertFailed(t, c)
 			})
 		}
@@ -290,11 +293,26 @@ func TestPrepareInPhaseStillSucceeds(t *testing.T) {
 // the caller gets the server's error and the conn lives, for each request kind.
 func TestServerErrorStillLeavesConnUsable(t *testing.T) {
 	errResp := dsFrame(protocol.BackendErrorResponse, []byte("SERROR\x00C42601\x00Msyntax error\x00\x00"))
+	fatalResp := dsFrame(protocol.BackendErrorResponse, []byte("SFATAL\x00C57P01\x00Mshutting down\x00\x00"))
 	for _, tc := range []struct {
 		name  string
 		parts [][]byte
 		run   func(c *pgConn) error
 	}{
+		// A FATAL after an ERROR, before ReadyForQuery: the caller still gets the
+		// first error.
+		{"simple-fatal-after-error", [][]byte{errResp, fatalResp, dsRFQ}, func(c *pgConn) error {
+			_, _, err := c.simpleExec(context.Background(), "BAD")
+			return err
+		}},
+		{"extended-fatal-after-error", [][]byte{errResp, fatalResp, dsRFQ}, func(c *pgConn) error {
+			_, err := c.extendedExec(context.Background(), "", "BAD", nil)
+			return err
+		}},
+		{"prepare-fatal-after-error", [][]byte{errResp, fatalResp, dsRFQ}, func(c *pgConn) error {
+			_, err := c.prepareStatement(context.Background(), "celst_1", "BAD")
+			return err
+		}},
 		{"simple", [][]byte{errResp, dsRFQ}, func(c *pgConn) error {
 			_, _, err := c.simpleExec(dsCtx(t), "BAD")
 			return err

@@ -108,9 +108,9 @@ func (s *CopyInState) Ready() bool {
 
 // Handle processes one incoming server message.
 func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
-	if s.Err != nil && msgType != BackendReadyForQuery &&
+	if s.Err != nil && msgType != BackendReadyForQuery && msgType != BackendErrorResponse &&
 		msgType != BackendNoticeResponse && msgType != BackendParameterStatus && msgType != BackendNotification {
-		// After an ErrorResponse the server sends nothing but ReadyForQuery.
+		// After an ErrorResponse the server sends nothing but ReadyForQuery (and a FATAL).
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in COPY IN after an ErrorResponse", msgType)
 	}
 	switch msgType {
@@ -137,7 +137,9 @@ func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
 		s.phase = copyInDone
 		return false, nil
 	case BackendErrorResponse:
-		s.Err = ParseErrorResponse(payload)
+		if s.Err == nil { // a FATAL after an ERROR: the first error is the one the caller gets
+			s.Err = ParseErrorResponse(payload)
+		}
 		s.phase = copyInDone
 		return false, nil
 	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
@@ -178,9 +180,9 @@ type CopyOutState struct {
 // message; the slice alias rules match the other state machines (callers
 // must copy for retention).
 func (s *CopyOutState) Handle(msgType byte, payload []byte, onRow func([]byte)) (bool, error) {
-	if s.Err != nil && msgType != BackendReadyForQuery &&
+	if s.Err != nil && msgType != BackendReadyForQuery && msgType != BackendErrorResponse &&
 		msgType != BackendNoticeResponse && msgType != BackendParameterStatus && msgType != BackendNotification {
-		// After an ErrorResponse the server sends nothing but ReadyForQuery.
+		// After an ErrorResponse the server sends nothing but ReadyForQuery (and a FATAL).
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in COPY OUT after an ErrorResponse", msgType)
 	}
 	switch msgType {
@@ -220,7 +222,9 @@ func (s *CopyOutState) Handle(msgType byte, payload []byte, onRow func([]byte)) 
 		s.Tag = tag
 		return false, nil
 	case BackendErrorResponse:
-		s.Err = ParseErrorResponse(payload)
+		if s.Err == nil { // a FATAL after an ERROR: the first error is the one the caller gets
+			s.Err = ParseErrorResponse(payload)
+		}
 		return false, nil
 	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
 		return false, nil

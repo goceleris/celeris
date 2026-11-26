@@ -56,10 +56,15 @@ func TestExtendedQueryReadyForQueryNeedsACompleteReply(t *testing.T) {
 	if done, err := e.Handle(BackendCopyData, nil, nil); done || err == nil {
 		t.Fatalf("extended: a message after ErrorResponse: done=%v err=%v, want (false, error)", done, err)
 	}
+	// A FATAL after an ERROR keeps the first error, in every state.
+	fatal := []byte("SFATAL\x00C57P01\x00Mshutting down\x00\x00")
 	e = &ExtendedQueryState{}
 	_, _ = e.Handle(BackendErrorResponse, errResp, nil)
-	if _, err := e.Handle(BackendErrorResponse, errResp, nil); err == nil {
-		t.Fatal("extended: a second ErrorResponse")
+	if _, err := e.Handle(BackendErrorResponse, fatal, nil); err != nil {
+		t.Fatalf("extended: a second ErrorResponse: %v", err)
+	}
+	if _, err := e.Handle(BackendReadyForQuery, []byte{'I'}, nil); err == nil || e.Err.Code != "42601" {
+		t.Fatalf("extended: want the first error 42601, got %+v / %v", e.Err, err)
 	}
 	e = &ExtendedQueryState{}
 	_, _ = e.Handle(BackendErrorResponse, errResp, nil)

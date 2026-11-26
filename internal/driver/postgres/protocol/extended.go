@@ -321,7 +321,8 @@ func (e *ExtendedQueryState) Handle(
 	switch msgType {
 	case BackendErrorResponse:
 		if e.phase == exPhaseErrored {
-			return false, unexpected("ErrorResponse", e.phase)
+			// A FATAL after an ERROR: the first error is the one the caller gets.
+			return false, nil
 		}
 		e.Err = ParseErrorResponse(payload)
 		e.phase = exPhaseErrored

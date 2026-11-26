@@ -672,7 +672,9 @@ func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error)
 	case protocol.BackendNoticeResponse, protocol.BackendParameterStatus, protocol.BackendNotification:
 		return false, nil
 	case protocol.BackendErrorResponse:
-		p.err = protocol.ParseErrorResponse(payload)
+		if p.err == nil { // a FATAL after an ERROR: the first error is the one the caller gets
+			p.err = protocol.ParseErrorResponse(payload)
+		}
 		return false, nil
 	case protocol.BackendReadyForQuery:
 		if p.err != nil {
@@ -1861,6 +1863,10 @@ var errReplyDesync = fmt.Errorf("%w: its reply stream no longer matched its requ
 // but fix the call. Only the native Pool has COPY (Pool.CopyFrom, Pool.CopyTo),
 // and the message says so.
 type copyThroughQueryError struct{ response string }
+
+// Unwrap makes errors.Is(err, ErrClosed) true, as for every other error of a
+// connection failed because its reply stream stopped matching its queue.
+func (e *copyThroughQueryError) Unwrap() error { return ErrClosed }
 
 func (e *copyThroughQueryError) Error() string {
 	return "celeris-postgres: the statement is a COPY (the server answered with " + e.response +

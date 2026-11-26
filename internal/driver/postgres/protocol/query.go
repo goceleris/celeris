@@ -436,9 +436,10 @@ func (q *SimpleQueryState) Handle(
 		}
 		return true, nil
 	}
-	if q.Err != nil {
+	if q.Err != nil && msgType != BackendErrorResponse {
 		// After an ErrorResponse the server sends nothing but ReadyForQuery
-		// (and the out-of-band messages above): the rest of the query is skipped.
+		// (and the out-of-band messages above, and a FATAL ErrorResponse): the
+		// rest of the query is skipped.
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in simple query after an ErrorResponse", msgType)
 	}
 	switch msgType {
@@ -478,6 +479,10 @@ func (q *SimpleQueryState) Handle(
 		q.phase = sqPhaseAwaitResult
 		return false, nil
 	case BackendErrorResponse:
+		if q.Err != nil {
+			// A FATAL after an ERROR: the first error is the one the caller gets.
+			return false, nil
+		}
 		q.Err = ParseErrorResponse(payload)
 		// Server will still send RFQ; stay in sqPhaseAwaitResult.
 		q.phase = sqPhaseAwaitResult
