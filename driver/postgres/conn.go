@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -824,6 +825,12 @@ type pgConn struct {
 	fdMu        sync.Mutex
 	fdReleased  bool
 
+	// stmtPrefix is the per-connection part of every server-side statement
+	// name this conn mints ("celst_" + 128 random bits), set once when the conn
+	// is built and never changed; stmtCounter is the per-connection part after
+	// it and only counts up, so a name is never minted twice by this conn (see
+	// [newStmtNamePrefix]).
+	stmtPrefix  string
 	stmtCounter uint64
 
 	// sessionDirty tracks whether the connection state has been modified in a
@@ -1204,6 +1211,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 		writer:       protocol.NewWriter(),
 		bridge:       async.NewBridge(),
 		stmtCache:    newLRU(dsn.Options.StatementCacheSize),
+		stmtPrefix:   newStmtNamePrefix(),
 		autoCache:    dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
@@ -1977,9 +1985,34 @@ func (c *pgConn) PrepareContext(ctx context.Context, query string) (driver.Stmt,
 	return &pgStmt{conn: c, prep: prep, query: query, cached: true}, nil
 }
 
+// stmtNameTag starts every named statement the driver prepares.
+const stmtNameTag = "celst_"
+
+// newStmtNamePrefix returns the per-connection prefix of the statement names a
+// conn mints: "celst_" and 128 random bits (crypto/rand, 26 base32 characters),
+// drawn once per connection when it is built. A named statement lives on the
+// server connection, and a pooler that shares one server connection between
+// client connections without tracking prepared statements (PgBouncer in
+// transaction mode with max_prepared_statements=0) lets two clients Parse the
+// same name with different SQL on it; a Bind of that name then runs the other
+// client's statement. A prefix that no two connections share, across processes
+// and restarts, keeps a Bind from ever naming a statement this connection did
+// not Parse. The longest name is the prefix, "_" and a 20-digit counter: 53
+// bytes, under PostgreSQL's 63-byte identifier limit.
+func newStmtNamePrefix() string {
+	return stmtNameTag + rand.Text()
+}
+
+// mintStmtName returns a new statement name: the connection's prefix and its
+// counter. It runs when a statement is prepared, never when one is reused: the
+// cached entry keeps the name.
 func (c *pgConn) mintStmtName() string {
 	n := atomic.AddUint64(&c.stmtCounter, 1)
-	return fmt.Sprintf("celst_%d", n)
+	var buf [64]byte
+	b := append(buf[:0], c.stmtPrefix...)
+	b = append(b, '_')
+	b = strconv.AppendUint(b, n, 10)
+	return string(b)
 }
 
 // prepareStatement runs Parse + Describe 'S' + Sync and returns the post-
