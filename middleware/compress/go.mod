@@ -3,15 +3,15 @@ module github.com/goceleris/celeris/middleware/compress
 go 1.27.3
 
 require (
-	github.com/andybalholm/brotli v1.2.7
+	github.com/andybalholm/brotli v1.3.0
 	github.com/goceleris/celeris v1.5.11
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.5
 )
 
 require (
-	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )
 
 // In the monorepo, build against the in-tree celeris core so submodule
