@@ -132,6 +132,9 @@ func (tx *Tx) addCmd3(kind cmdKind, a0, a1, a2 string) *pipeCmd {
 //     error.
 //   - After Exec, the tx is done: further Watch/Exec/command calls return an
 //     error. The conn is returned to the pool.
+//
+// A connection error from Exec does not prove that the transaction was not
+// applied: see Errors from writes in the package documentation.
 func (tx *Tx) Exec(ctx context.Context) error {
 	if tx.done {
 		return errTxDone

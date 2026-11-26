@@ -308,6 +308,9 @@ func (p *Pipeline) Discard() {
 //
 // After a successful Exec, a second Exec returns an error at once (it does not
 // block or touch a connection): Discard before queueing a new batch.
+//
+// A connection error from Exec does not prove that the batch was not applied:
+// see Errors from writes in the package documentation.
 func (p *Pipeline) Exec(ctx context.Context) error {
 	if p.executed {
 		return errPipelineExecuted

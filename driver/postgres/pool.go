@@ -480,7 +480,9 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result]. A statement that
+// ExecContext runs a statement and returns a [Result]. An error does not prove
+// that the statement was not applied: see Errors from writes in the package
+// documentation. A statement that
 // succeeds and leaves a transaction open on the connection (Exec "BEGIN")
 // returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
 // that fails returns its own error, unchanged, as before (a connection left in
@@ -1417,7 +1419,9 @@ func (t *Tx) Rollback() error {
 	return err
 }
 
-// ExecContext runs a statement on the pinned conn.
+// ExecContext runs a statement on the pinned conn. An error does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	if t.done.Load() {
 		return Result{}, errTxDone

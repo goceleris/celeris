@@ -102,6 +102,13 @@
 // GOMAXPROCS) and unbounded with a negative PoolSize. Pub/sub and the other pools
 // are not affected, and no other platform has the poll(2) wait.
 //
+// # Errors from writes
+//
+// An error from a write does not prove that the write was not applied: a
+// connection that closes right after the server answered can be reported as a
+// failure (celeris#1460); do not blindly retry Incr, Decr or other
+// non-idempotent commands on a connection error.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores

@@ -213,7 +213,8 @@ func (c *Client) storeCmd(ctx context.Context, cmd string, key string, value []b
 	})
 }
 
-// Set stores value at key, overwriting any existing value.
+// Set stores value at key, overwriting any existing value. An error does not
+// prove that it was not stored: see the Client documentation.
 func (c *Client) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
 	b, err := asBytes(value)
 	if err != nil {
@@ -604,14 +605,16 @@ func (c *Client) Gets(ctx context.Context, key string) (CASItem, error) {
 // Incr atomically increments the integer value at key by delta and returns
 // the new value. The server returns [ErrCacheMiss] if the key is missing
 // (use Set first to initialize) or a MemcachedError if the existing value
-// is not a decimal integer.
+// is not a decimal integer. An error does not prove that the value was not
+// incremented: do not blindly retry it (see the Client documentation).
 func (c *Client) Incr(ctx context.Context, key string, delta uint64) (uint64, error) {
 	return c.arith(ctx, "incr", protocol.OpIncrement, key, delta)
 }
 
 // Decr atomically decrements the integer value at key by delta and returns
 // the new value. The memcached server clamps the result at 0 (it does not
-// wrap to MAX_UINT).
+// wrap to MAX_UINT). An error does not prove that the value was not decremented:
+// do not blindly retry it (see the Client documentation).
 func (c *Client) Decr(ctx context.Context, key string, delta uint64) (uint64, error) {
 	return c.arith(ctx, "decr", protocol.OpDecrement, key, delta)
 }
@@ -680,7 +683,8 @@ func (c *Client) arith(ctx context.Context, cmd string, opcode byte, key string,
 // ---------- delete / touch / flush ----------
 
 // Delete removes key from the cache. Returns [ErrCacheMiss] if the key did
-// not exist.
+// not exist. An error does not prove that the key was not removed: see the
+// Client documentation.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	if err := validateKey(key); err != nil {
 		return err

@@ -10,6 +10,11 @@ import (
 
 // Client is the high-level handle users interact with. It owns a pool of
 // connections and hands out per-command round trips.
+//
+// An error from a write command (Set, Del, Incr, ... and Do) does not prove that
+// the write was not applied: a connection that closes right after the server
+// answered can be reported as a failure (celeris#1460); do not blindly retry
+// Incr, Decr or other non-idempotent commands on a connection error.
 type Client struct {
 	cfg  Config
 	pool *redisPool
@@ -145,7 +150,9 @@ func (c *Client) IdleConnWorkers() []int {
 // (OBJECT ENCODING, CLUSTER INFO, SCRIPT LOAD, XADD, FUNCTION, ...). Args
 // are converted to strings via [argify]; the returned [Value] is
 // detached from the Reader buffer and safe to retain. Server error replies
-// surface as [*RedisError] via the returned error.
+// surface as [*RedisError] via the returned error. An error from a write command
+// does not prove that it was not applied: see Errors from writes in the package
+// documentation.
 func (c *Client) Do(ctx context.Context, args ...any) (*Value, error) {
 	if len(args) == 0 {
 		return nil, errors.New("celeris-redis: Do requires at least one argument")

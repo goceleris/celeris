@@ -10,6 +10,12 @@ import (
 
 // Client is the high-level handle users interact with. It owns a pool of
 // connections and hands out per-command round trips.
+//
+// An error from a write (Set, Add, Replace, Append, Prepend, Delete, Incr, Decr,
+// Touch, CAS, Flush) does not prove that the write was not applied: a connection
+// that closes right after the server answered can be reported as a failure
+// (celeris#1460); do not blindly retry Incr, Decr or other non-idempotent
+// commands on a connection error.
 type Client struct {
 	cfg  Config
 	pool *memcachedPool
