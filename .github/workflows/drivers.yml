@@ -113,7 +113,7 @@ jobs:
       - name: Connector on a started server
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
-          -run 'TestConnectorStartedEngine|TestConnectorDialledBeforeStart|TestConnectorResultCapPerMode' ./driver/postgres/
+          -run 'TestConnectorStartedEngine|TestConnectorDialledBeforeStart|TestConnectorResultCapPerMode|TestConnectorStartedServerKeepsTheCapThroughTheChain' ./driver/postgres/
       # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
       # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
       # or has answered a request first (default-ready). Latest server version only.
