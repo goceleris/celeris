@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
@@ -350,6 +351,7 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		}
 		req = head.(*redisRequest)
 	}
+	eventloop.DispatchPause() // test instrument; with none installed: a call and an atomic load
 	if v.Type == protocol.TyError || v.Type == protocol.TyBlobErr {
 		req.resultErr = parseError(v.Str)
 		req.expect = expectNone
