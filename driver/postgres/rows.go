@@ -212,9 +212,9 @@ func (r *pgRows) ColumnTypeDatabaseTypeName(i int) string {
 	return codec.Name
 }
 
-// HasNextResultSet reports whether a multi-statement simple query produced
-// another result set after the current one. The driver flattens multi-
-// statement results into a single pgRows, so this is always false.
+// HasNextResultSet is always false: the driver has no multiple result sets. A
+// query whose statements return rows in more than one of them fails with
+// errMultiResultSets instead of being flattened into one pgRows.
 func (r *pgRows) HasNextResultSet() bool { return false }
 
 // NextResultSet advances to the next result set; always returns io.EOF for

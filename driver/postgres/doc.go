@@ -30,7 +30,11 @@
 // [Tx.Rollback], and savepoint helpers ([Tx.Savepoint],
 // [Tx.ReleaseSavepoint], [Tx.RollbackToSavepoint]). Bulk loads use
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
-// [Pool.CopyTo].
+// [Pool.CopyTo]. A call to [Tx.Commit] or [Tx.Rollback] ends the Tx whatever it
+// returns: a failed Commit is not retried on the same Tx, every later call on the
+// Tx returns [ErrTxDone] (a deferred Rollback after a failed Commit is safe), and
+// its connection is released: back to the pool if the driver knows the session is
+// idle, discarded otherwise.
 //
 // Server errors surface as [*PGError] carrying the SQLSTATE code; match
 // with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],
