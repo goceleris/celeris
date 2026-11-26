@@ -5,7 +5,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -143,6 +142,13 @@ type pgRequest struct {
 	rowCh     chan [][]byte
 	colsCh    chan struct{}
 	streamErr atomic.Pointer[error] // set before closeRowCh so readers see the error race-free
+	// srvErr is the last ErrorResponse dispatch read for this request. A server
+	// that ends the connection sends its error first (FATAL 57P01 after
+	// pg_terminate_backend) and no ReadyForQuery after it, so the state machine
+	// never returns it; failAll gives it to the caller in place of a bare
+	// close. Set only on an ErrorResponse; atomic because failAll can run on
+	// another goroutine than dispatch.
+	srvErr atomic.Pointer[protocol.PGError]
 	// The streaming channels are closed from two goroutines: dispatch (a
 	// request that finishes, an error) and failAll (the conn closes), while
 	// OnRow may be sending on rowCh from dispatch. They are closed only
@@ -273,6 +279,19 @@ func (r *pgRequest) fail(err error) {
 	r.finished.Store(true)
 }
 
+// failedErr returns the error r was failed with: the first fail's, which a
+// failAll that the same poll triggered (the loop's onClose runs inside
+// WriteAndPoll) set before the caller's failReq, and fallback when none is.
+func (r *pgRequest) failedErr(fallback error) error {
+	r.doneMu.Lock()
+	err := r.err
+	r.doneMu.Unlock()
+	if err == nil {
+		return fallback
+	}
+	return err
+}
+
 // pgRequestPool amortizes pgRequest + its embedded state machines + its
 // doneCh + rows/rowFields/rowSlab across queries on the hot path. We do NOT
 // pool the copy machinery (copyReady/copyIn/copyOut/onCopyRow): those rare
@@ -377,6 +396,7 @@ func releasePgRequest(r *pgRequest) {
 	r.syncMode.Store(false)
 	r.colsCh = nil
 	r.streamErr.Store(nil)
+	r.srvErr.Store(nil)
 	pgRequestPool.Put(r)
 }
 
@@ -781,7 +801,6 @@ type pgConn struct {
 	maxIdleTime time.Duration
 
 	closeOnce sync.Once
-	closeErr  atomic.Value // error
 	closed    atomic.Bool
 	// closeWG tracks background goroutines a conn may start, so Close can
 	// join them and none outlives the conn. None starts one today (an evicted
@@ -995,12 +1014,9 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 				c.onRecv(c.directBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
-				if errors.Is(perr, io.EOF) {
-					perr = io.ErrUnexpectedEOF
-				}
 				c.failAll(perr)
 				_ = c.closeDirect()
-				return perr
+				return connLost(req, perr)
 			}
 		}
 		n, err := c.tcp.Read(c.directBuf)
@@ -1020,12 +1036,9 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 				}
 				return c.cancelDrainDirect(req, cerr)
 			}
-			if errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF
-			}
 			c.failAll(err)
 			_ = c.closeDirect()
-			return err
+			return connLost(req, err)
 		}
 	}
 }
@@ -1105,9 +1118,6 @@ func (c *pgConn) startDirectReader() func() {
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
-				}
-				if errors.Is(err, io.EOF) {
-					err = io.ErrUnexpectedEOF
 				}
 				c.failAll(err)
 				return
@@ -1569,6 +1579,11 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 	// The last act on head is the unpin, as in failAll; deferred so a panic in
 	// dispatchHead (a CopyTo dest callback) does not keep the pin for good.
 	defer head.failPins.Add(-1)
+	if msgType == protocol.BackendErrorResponse {
+		// Kept for failAll: a connection that closes before the ReadyForQuery
+		// that would deliver this error must still return it (see srvErr).
+		head.srvErr.Store(protocol.ParseErrorResponse(payload))
+	}
 	return c.dispatchHead(head, msgType, payload)
 }
 
@@ -1841,16 +1856,30 @@ func promoteToStreaming(req *pgRequest) {
 // requests. Running concurrently with Close() is safe because both paths
 // take fdMu for the fd and failAll is idempotent under closeOnce's covering
 // atomic Store.
+//
+// err is nil on the peer's orderly shutdown (FIN). The request in flight is
+// not complete then (it has no ReadyForQuery), so failAll gives it an error
+// (lostError), never io.EOF: database/sql and Rows.Next read a bare io.EOF as
+// the end of a result.
 func (c *pgConn) onClose(err error) {
-	if err == nil {
-		err = io.EOF
-	}
-	c.closeErr.Store(err)
 	c.shutdownFD()
 	c.failAll(err)
 }
 
-// failAll surfaces err to every pending request and marks the conn dead.
+// connLost is the error failAll gives req when the connection ends with cause:
+// the server's ErrorResponse if one arrived for req and was not delivered yet,
+// else lostError(cause).
+func connLost(req *pgRequest, cause error) error {
+	if srv := req.srvErr.Load(); srv != nil {
+		return srv
+	}
+	return lostError(cause)
+}
+
+// failAll surfaces err to every pending request and marks the conn dead. A
+// request is cut off, not complete, so what it gets is never a bare io.EOF:
+// lostError(err), which matches ErrClosed and io.ErrUnexpectedEOF, or the
+// server's own ErrorResponse when it sent one before the close.
 func (c *pgConn) failAll(err error) {
 	c.closed.Store(true)
 	c.pendingMu.Lock()
@@ -1868,10 +1897,26 @@ func (c *pgConn) failAll(err error) {
 		}
 	}
 	c.pendingMu.Unlock()
-	c.bridge.DrainWithError(err, nil)
+	// A FATAL ErrorResponse of the head ends the connection, so it is the
+	// answer of every request queued behind it as well.
+	var fatal *protocol.PGError
+	if len(queue) > 0 && queue[0] != nil {
+		if srv := queue[0].srvErr.Load(); fatalServerError(srv) {
+			fatal = srv
+		}
+	}
+	lost := lostError(err)
+	if fatal != nil {
+		lost = fatal
+	}
+	c.bridge.DrainWithError(lost, nil)
 	for _, r := range queue {
 		if r == nil {
 			continue
+		}
+		rerr := lost
+		if fatal == nil {
+			rerr = connLost(r, err)
 		}
 		// Close streaming channels so the consumer unblocks. dispatch may
 		// have closed them already, and may be sending on rowCh right now:
@@ -1880,7 +1925,7 @@ func (c *pgConn) failAll(err error) {
 		// The error is stored whether or not r is streaming yet: dispatch can
 		// promote it between a check and the close, and a consumer that sees
 		// rowCh closed without it would read the cut-off result as complete.
-		r.streamErr.Store(&err)
+		r.streamErr.Store(&rerr)
 		if r.closeRowCh() {
 			// Streaming: the caller may be parked on colsCh. A request that
 			// has not promoted has no rowCh to hand over, and its caller wakes
@@ -1890,7 +1935,7 @@ func (c *pgConn) failAll(err error) {
 		// Use fail() so concurrent failReq (caller goroutine Write-error
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
-		r.fail(err)
+		r.fail(rerr)
 		// The last touch of r: after this a releasePgRequest may recycle it.
 		r.failPins.Add(-1)
 	}
@@ -2324,6 +2369,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
+			err = req.failedErr(err)
 			releasePgRequest(req)
 			return nil, err
 		}
@@ -2488,6 +2534,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
+			err = req.failedErr(err)
 			releasePgRequest(req)
 			return "", 0, err
 		}
@@ -2574,6 +2621,7 @@ func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback b
 		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
+			err = req.failedErr(err)
 			releasePgRequest(req)
 			return false, err
 		}
@@ -2709,6 +2757,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
 			c.failReq(req, werr)
+			werr = req.failedErr(werr)
 			releasePgRequest(req)
 			return nil, werr
 		}
@@ -2816,6 +2865,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
 			c.failReq(req, werr)
+			werr = req.failedErr(werr)
 			releasePgRequest(req)
 			return nil, werr
 		}

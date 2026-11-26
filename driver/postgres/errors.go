@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"io"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
@@ -16,7 +17,15 @@ var ErrSSLNotSupported = errors.New("celeris-postgres: TLS/SSL is not yet suppor
 // mechanism other than SCRAM-SHA-256).
 var ErrUnsupportedAuth = errors.New("celeris-postgres: unsupported authentication method")
 
-// ErrClosed is returned from operations on a closed pgConn.
+// ErrClosed is returned from operations on a closed pgConn. It is also what a
+// statement that was in flight when the connection went away (the server or the
+// network closed it, the connection was closed or discarded, a timeout tore it
+// down) matches with errors.Is, together with [io.ErrUnexpectedEOF]: the result
+// is cut off and the error says so. Such an error never matches [io.EOF] (the
+// end of a result), and never [database/sql/driver.ErrBadConn], so database/sql
+// does not retry the statement. When the server sent an ErrorResponse before it
+// closed (a FATAL 57P01 after pg_terminate_backend), the error is that
+// [*PGError] instead.
 var ErrClosed = errors.New("celeris-postgres: connection closed")
 
 // ErrTxCommitRollback is returned from Commit when PostgreSQL answered COMMIT
@@ -100,4 +109,72 @@ type PGError = protocol.PGError
 func isPreparedStatementNotFound(err error) bool {
 	var pgErr *protocol.PGError
 	return errors.As(err, &pgErr) && pgErr.Code == "26000"
+}
+
+// connLostError is the error of a request that the connection's end cut off
+// before its ReadyForQuery. It matches [ErrClosed] and [io.ErrUnexpectedEOF]
+// with errors.Is, and the cause (a reset, a timeout, a protocol error) when
+// there is one. It never matches [io.EOF]: database/sql and [Rows.Next] read
+// that as the end of a result. Its type is not exported; the sentinels are the
+// API.
+type connLostError struct {
+	cause error
+}
+
+func (e *connLostError) Error() string {
+	if e.cause == nil {
+		return "celeris-postgres: connection closed before the result was complete: unexpected EOF"
+	}
+	return "celeris-postgres: connection closed before the result was complete: " + e.cause.Error()
+}
+
+func (e *connLostError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{ErrClosed, io.ErrUnexpectedEOF}
+	}
+	return []error{ErrClosed, io.ErrUnexpectedEOF, e.cause}
+}
+
+// lostError returns the error for a request cut off by the end of the
+// connection with cause. An io.EOF cause (the peer's FIN) is dropped, so the
+// result is never mistaken for a clean end. An error that is already a
+// connLostError or a server error is returned as it is.
+func lostError(cause error) error {
+	switch cause {
+	case nil, io.EOF, io.ErrUnexpectedEOF, ErrClosed:
+		return &connLostError{}
+	}
+	var le *connLostError
+	if errors.As(cause, &le) {
+		return cause
+	}
+	var pe *protocol.PGError
+	if errors.As(cause, &pe) {
+		return cause
+	}
+	if errors.Is(cause, io.EOF) {
+		return &connLostError{}
+	}
+	return &connLostError{cause: cause}
+}
+
+// fatalServerError reports whether e ends the connection: a FATAL or PANIC
+// severity (the non-localized V field when present) or an operator
+// intervention shutdown (SQLSTATE 57P01, 57P02, 57P03).
+func fatalServerError(e *protocol.PGError) bool {
+	if e == nil {
+		return false
+	}
+	sev := e.Severity
+	if v := e.Extra['V']; v != "" {
+		sev = v
+	}
+	if sev == "FATAL" || sev == "PANIC" {
+		return true
+	}
+	switch e.Code {
+	case "57P01", "57P02", "57P03":
+		return true
+	}
+	return false
 }
