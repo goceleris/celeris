@@ -170,6 +170,16 @@ func appendEscapedByte(dst []byte, b byte) []byte {
 // the number of rows imported (parsed from the server's CommandComplete tag)
 // or any transport / iteration error. Column names may be empty to default
 // to the table's natural column order.
+//
+// Cancellation. A ctx that ends while the call waits for the server to accept
+// the COPY (its CopyInResponse) closes the connection (the pool replaces it) and
+// returns the context's error; no row was written. A ctx that ends later, once
+// the server accepted the COPY, can return an error although the COPY
+// committed: the call returns ctx.Err() on one path and the server's
+// cancellation error (a *PGError, SQLSTATE 57014, which does not match
+// errors.Is(err, context.DeadlineExceeded)) on another, and the server may
+// already have committed the rows. Do not retry a CopyFrom that returned a
+// context error without checking the table: a retry can duplicate rows.
 func (p *Pool) CopyFrom(ctx context.Context, tableName string, columns []string, src CopyFromSource) (int64, error) {
 	c, err := p.acquire(ctx)
 	if err != nil {
@@ -181,16 +191,27 @@ func (p *Pool) CopyFrom(ctx context.Context, tableName string, columns []string,
 
 // CopyTo executes query (typically "COPY <table> TO STDOUT ...") and invokes
 // dest for each row. The dest slice is freshly allocated per call, so
-// callers are free to retain it without copying. Aborting mid-stream by
-// returning a non-nil error from dest terminates the copy — the server
-// continues to stream bytes until ReadyForQuery, so the conn remains usable
-// on return.
+// callers are free to retain it without copying.
+//
+// Returning a non-nil error from dest makes CopyTo return that error (the
+// first one), but it does not stop the copy: dest is still called for every
+// remaining row, and the server is not cancelled. CopyTo returns once the
+// server has finished streaming, so the conn remains usable on return. To stop
+// early, cancel ctx.
+//
+// dest can also be called after CopyTo has returned an error. When ctx ends and
+// the cancel exchange does not finish, or the server does not answer the cancel
+// within 30 s, CopyTo returns at once and a dispatch that is already running
+// can still call dest, once, concurrently with the caller's own code. Do not
+// read or reuse state that dest captures (a buffer or slice it appends to, a
+// counter) after CopyTo returns without synchronization.
 //
 // dest does not run on the goroutine that called CopyTo. It runs where the
 // conn's bytes are read: on the event-loop worker goroutine that owns the conn
 // (which serves every other conn on that worker too), or on the conn's reader
 // goroutine in direct mode. So dest must return quickly and must not block:
-// while it runs, no other conn on the worker is read. It must not call
+// while it runs, no other conn on the worker is read, and in direct mode
+// CopyTo does not return while dest blocks. It must not call
 // runtime.Goexit either (a test's t.FailNow or t.SkipNow, or a library that
 // does): that ends the worker goroutine and every conn on it is never read
 // again. The event loop logs an error when that happens (through slog.Default

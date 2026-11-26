@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"errors"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
@@ -27,6 +28,18 @@ var ErrClosed = errors.New("celeris-postgres: connection closed")
 // again. It matches with errors.Is, also through database/sql, whose Tx.Commit
 // returns the driver's error as it is.
 var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resulted in rollback")
+
+// ErrTxDone is returned by every method of a [Tx] after Commit or Rollback has
+// been called on it, whatever that call returned (a Commit that failed ends the
+// Tx too). Nothing is sent to the server. It keeps the message the driver always
+// had and matches [database/sql.ErrTxDone] with errors.Is, as code written against
+// database/sql expects.
+var ErrTxDone error = txDoneError{}
+
+type txDoneError struct{}
+
+func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
+func (txDoneError) Unwrap() error { return sql.ErrTxDone }
 
 // ErrBadConn is returned when a connection is in an unusable state; returning
 // it causes database/sql to evict the conn and open a fresh one.
@@ -73,6 +86,19 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // well. Before v1.6.0 a direct-mode Pool buffered the whole reply (several times
 // its size in memory) before it returned this error.
 var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate the query")
+
+// errMultiResultSets is the error of a row-returning query (Query, QueryRow,
+// QueryContext, on a Pool, a Tx or a *sql.DB) whose text holds several
+// statements of which more than one returns rows. The driver returns one result
+// set; before this error it returned the first set's rows under the LAST set's
+// column names (the second set's rows appended when the shapes matched). The
+// server has run every statement (a multi-statement simple query is one
+// implicit transaction, committed unless a statement failed); the error is
+// raised once the whole reply is read, and the connection is ready for the next
+// query. A query string whose statements return rows in only one of them (SET
+// then SELECT, SELECT then UPDATE, INSERT then SELECT) is not affected, and Exec
+// accepts any number of statements. Unexported: the error text is the contract.
+var errMultiResultSets = errors.New("celeris-postgres: multiple result sets are not supported; the server has executed the statements")
 
 // ErrDirectModeUnsupported is returned by operations that rely on
 // unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY

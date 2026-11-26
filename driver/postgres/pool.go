@@ -487,6 +487,27 @@ func (p *Pool) releaseChecked(c *pgConn) error {
 	return nil
 }
 
+// releaseAfterTxEnd frees the conn of a Tx that Commit or Rollback has ended, and
+// the pool slot with it, exactly once. err is what the COMMIT or ROLLBACK returned.
+// The conn goes back to the pool only if the driver knows its state: no error, the
+// sentinel ErrTxCommitRollback (the reply was read: the server answered COMMIT with
+// ROLLBACK), or an error the server reported (an ErrorResponse, which the server
+// follows with ReadyForQuery). For those, releaseChecked still discards a conn that
+// is closed or whose last ReadyForQuery said a transaction is open or failed (a
+// FATAL, which has no ReadyForQuery, leaves the status of BEGIN). Any other error
+// (the wire failed, a read or write error, a cancelled wait) leaves the state
+// unknown: the conn is closed, not reused, and no ROLLBACK is sent to rescue it.
+func (p *Pool) releaseAfterTxEnd(c *pgConn, err error) {
+	if err != nil && !errors.Is(err, ErrTxCommitRollback) {
+		var pgErr *PGError
+		if !errors.As(err, &pgErr) {
+			p.inner.Discard(c)
+			return
+		}
+	}
+	p.release(c)
+}
+
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
 // returns the conn to the pool when closed.
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
@@ -675,7 +696,11 @@ func (r *Rows) Columns() []string {
 
 // Close releases resources and returns the conn to the pool. A statement that
 // left a transaction open on the conn (Query "BEGIN") makes Close return
-// [ErrTxLeftOpen] after discarding the conn. Close is idempotent: every call
+// [ErrTxLeftOpen] after discarding the conn. A query in which more than one
+// statement returned rows fails with an error that says multiple result sets are
+// not supported and the server executed the statements; a streamed one delivers
+// the first set's rows and then returns that error from [Rows.Err] and from
+// Close. Close is idempotent: every call
 // after the first returns nil and does nothing (so ErrTxLeftOpen is reported
 // once), which makes `defer rows.Close()` next to an explicit Close fine. After
 // Close, Next returns false, Scan returns an error and Err keeps the error
@@ -1334,10 +1359,12 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	r.rows = nil
 	defer func() {
-		// Only the error of a transaction left open on the conn is the
-		// caller's, and only when the scan went well or found no row; any other
-		// error of Close or of the scan is left as it was.
-		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+		// Only the error of a transaction left open on the conn, and the error
+		// of a query that returned more than one result set (it streamed: the
+		// first row is already scanned), are the caller's, and only when the
+		// scan went well or found no row; any other error of Close or of the
+		// scan is left as it was.
+		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) || cerr == errMultiResultSets {
 			switch {
 			case err == nil:
 				err = cerr
@@ -1393,58 +1420,50 @@ type Tx struct {
 	done atomic.Bool
 }
 
-// txDoneError is returned by a Tx used after Commit or Rollback. It keeps the
-// message the driver always had and matches sql.ErrTxDone with errors.Is, as
-// code written against database/sql expects.
-type txDoneError struct{}
-
-func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
-func (txDoneError) Unwrap() error { return sql.ErrTxDone }
-
-var errTxDone error = txDoneError{}
-
-// Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire, except
-// for ErrTxCommitRollback: the server rolled the transaction back, so it is over
-// (done stays set, the conn is released) and a later Rollback returns "tx already
-// finished". After the tx is finished it returns an error that matches
-// sql.ErrTxDone. A Rollback from another goroutine that runs while the Commit is
-// still in flight also gets ErrTxDone, even if that Commit then fails; the
-// goroutine that called Commit can still Rollback after the failure.
+// Commit commits the transaction. A call to Commit ends the Tx whatever it
+// returns: every later call on it (Commit, Rollback, ExecContext, QueryContext,
+// QueryRow, Savepoint, ReleaseSavepoint, RollbackToSavepoint) returns [ErrTxDone]
+// and sends nothing, so a deferred Rollback after a failed Commit is safe, and a
+// failed Commit is not retried on the same Tx. When the error is one the server
+// reported (a *[PGError], for example a deferred constraint or a serialization
+// failure), PostgreSQL rolled the transaction back. When the connection failed on
+// the wire before the reply was read, the outcome is unknown: the transaction may
+// have been committed. The Tx is ended either way.
+//
+// The connection goes back to the pool only if the driver knows its state: the
+// server's reply was read up to ReadyForQuery and the session is idle, outside a
+// transaction. In every other case (the connection failed on the wire, the reply
+// did not arrive, ReadyForQuery reports a transaction still open or failed) it is
+// closed and replaced. The pool slot is released exactly once.
+//
+// A Commit of a transaction the server had already put in the aborted state
+// returns [ErrTxCommitRollback]: nothing was committed.
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Commit()
-	if errors.Is(err, ErrTxCommitRollback) {
-		// The server rolled the transaction back: it is over (done is set by the
-		// CAS above and stays), the conn is free.
-		t.pool.release(t.conn)
-		return err
-	}
-	if err != nil {
-		t.done.Store(false)
-		return err
-	}
-	t.pool.release(t.conn)
-	return nil
+	t.pool.releaseAfterTxEnd(t.conn, err)
+	return err
 }
 
-// Rollback rolls back the transaction and returns the conn to the pool. After
-// the tx is finished it returns an error that matches sql.ErrTxDone.
+// Rollback rolls back the transaction. Like [Tx.Commit] it ends the Tx whatever it
+// returns: a later call on the Tx returns [ErrTxDone], and the connection goes back
+// to the pool only if the reply was read up to ReadyForQuery with the session idle
+// (a Rollback that failed on the wire discards it).
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Rollback()
-	t.pool.release(t.conn)
+	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
 
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	if t.done.Load() {
-		return Result{}, errTxDone
+		return Result{}, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
@@ -1460,7 +1479,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 // closed before Commit/Rollback.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if t.done.Load() {
-		return nil, errTxDone
+		return nil, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
@@ -1484,7 +1503,7 @@ func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 // avoid SQL-injection.
 func (t *Tx) Savepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.Savepoint(ctx, name)
 }
@@ -1493,7 +1512,7 @@ func (t *Tx) Savepoint(ctx context.Context, name string) error {
 // Savepoint.
 func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.ReleaseSavepoint(ctx, name)
 }
@@ -1502,7 +1521,7 @@ func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 // as Savepoint.
 func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
 }

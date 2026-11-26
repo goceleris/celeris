@@ -31,8 +31,10 @@
 //   - [NewClusterClient] ([ClusterClient]) and [NewSentinelClient]
 //     ([SentinelClient]) cover Redis Cluster and Sentinel deployments.
 //
-// Typed accessors and pipeline/Do results are detached from the reader buffer,
-// so returned values are safe to retain. Server error replies surface as
+// Values returned by Client methods, [Client.Do] and the typed Cmds of a [Tx]
+// are copies, safe to retain. Values read from a [Pipeline] (its typed Cmds)
+// are valid until [Pipeline.Release] or [Pipeline.Discard]: copy what you
+// keep. Server error replies surface as
 // [*RedisError] (with sentinels such as [ErrNil], [ErrWrongType],
 // [ErrCrossSlot]); see [errors.Is]. TLS (rediss://) is not yet supported.
 //
