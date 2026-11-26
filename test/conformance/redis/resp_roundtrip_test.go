@@ -89,6 +89,53 @@ func rtClients(t *testing.T, f func(t *testing.T, c *celredis.Client, resp int))
 	}
 }
 
+// rtReplyCell is one reply type read through Client.Do: the command, and the
+// reply rendered (renderValue) on RESP3 and on RESP2.
+type rtReplyCell struct {
+	name string
+	args []any
+	r3   string // expected render on RESP3
+	r2   string // expected render on RESP2
+}
+
+// rtReplyCells lists the reply-type cells TestRESPReplyTypes runs. k is the
+// key prefix of the test; kl, kh, ks and kz name the list, hash, set and
+// sorted set its setup fills.
+func rtReplyCells(k string) []rtReplyCell {
+	const set3 = "redis.setresp(3); "
+	kl, kh, ks, kz := k+":l", k+":h", k+":s", k+":z"
+	return []rtReplyCell{
+		{"simple_string_PING", []any{"PING"}, "simple(PONG)", "simple(PONG)"},
+		{"simple_string_SET", []any{"SET", k + ":n", "1"}, "simple(OK)", "simple(OK)"},
+		{"simple_string_status_reply", []any{"EVAL", "return redis.status_reply('FINE')", 0}, "simple(FINE)", "simple(FINE)"},
+		{"integer", []any{"INCR", k + ":max"}, "int(9223372036854775807)", "int(9223372036854775807)"},
+		{"integer_negative", []any{"TTL", k + ":nosuch"}, "int(-2)", "int(-2)"},
+		{"integer_zero", []any{"EXISTS", k + ":nosuch"}, "int(0)", "int(0)"},
+		{"bulk", []any{"GET", k}, "bulk(v)", "bulk(v)"},
+		{"bulk_empty", []any{"GET", k + ":e"}, "bulk()", "bulk()"},
+		{"bulk_unicode", []any{"ECHO", "héllo 世界 🚀"}, "bulk(héllo 世界 🚀)", "bulk(héllo 世界 🚀)"},
+		{"null_bulk", []any{"GET", k + ":nosuch"}, "null", "null"},
+		{"null_array_BLPOP_timeout", []any{"BLPOP", k + ":nosuch", "0.01"}, "null", "null"},
+		{"array", []any{"LRANGE", kl, 0, -1}, "array[bulk(a),bulk(b)]", "array[bulk(a),bulk(b)]"},
+		{"array_empty", []any{"LRANGE", k + ":nosuch", 0, -1}, "array[]", "array[]"},
+		{"array_with_nulls", []any{"MGET", k, k + ":nosuch", k}, "array[bulk(v),null,bulk(v)]", "array[bulk(v),null,bulk(v)]"},
+		{"array_nested", []any{"EVAL", "return {1,{2,{3,'x'}},{}}", 0}, "array[int(1),array[int(2),array[int(3),bulk(x)]],array[]]", "array[int(1),array[int(2),array[int(3),bulk(x)]],array[]]"},
+		{"map", []any{"HGETALL", kh}, "map{bulk(f1)=>bulk(v1),bulk(f2)=>bulk(v2)}", "array[bulk(f1),bulk(v1),bulk(f2),bulk(v2)]"},
+		{"map_int_values", []any{"EVAL", set3 + "return {map={a=1}}", 0}, "map{bulk(a)=>int(1)}", "array[bulk(a),int(1)]"},
+		{"set", []any{"SMEMBERS", ks}, "set[bulk(m1)]", "array[bulk(m1)]"},
+		{"double", []any{"ZSCORE", kz, "x"}, "double(1.5)", "bulk(1.5)"},
+		{"double_script", []any{"EVAL", set3 + "return {double=3.14}", 0}, "double(3.14)", "bulk(3.14)"},
+		{"double_inf", []any{"ZSCORE", kz, "pinf"}, "double(+Inf)", "bulk(inf)"},
+		{"double_neg_inf", []any{"ZSCORE", kz, "ninf"}, "double(-Inf)", "bulk(-inf)"},
+		{"double_in_array_WITHSCORES", []any{"ZRANGE", kz, 0, -1, "WITHSCORES"}, "array[array[bulk(ninf),double(-Inf)],array[bulk(x),double(1.5)],array[bulk(pinf),double(+Inf)]]", "array[bulk(ninf),bulk(-inf),bulk(x),bulk(1.5),bulk(pinf),bulk(inf)]"},
+		{"bool_true", []any{"EVAL", set3 + "return true", 0}, "bool(true)", "int(1)"},
+		{"bool_false", []any{"EVAL", set3 + "return false", 0}, "bool(false)", "int(0)"},
+		{"big_number", []any{"EVAL", set3 + "return {big_number='123456789012345678901234567890'}", 0}, "big(123456789012345678901234567890)", "bulk(123456789012345678901234567890)"},
+		{"big_number_negative", []any{"EVAL", set3 + "return {big_number='-99999999999999999999'}", 0}, "big(-99999999999999999999)", "bulk(-99999999999999999999)"},
+		{"verbatim_string", []any{"EVAL", set3 + "return {verbatim_string={string='hello', format='txt'}}", 0}, "verbatim(txt:hello)", "bulk(hello)"},
+	}
+}
+
 // TestRESPReplyTypes: one command per reply type, both protocols.
 func TestRESPReplyTypes(t *testing.T) {
 	rtClients(t, func(t *testing.T, c *celredis.Client, resp int) {
@@ -109,43 +156,7 @@ func TestRESPReplyTypes(t *testing.T) {
 				t.Fatalf("setup %v: %v", setup, err)
 			}
 		}
-		const set3 = "redis.setresp(3); "
-		type cell struct {
-			name string
-			args []any
-			r3   string // expected render on RESP3
-			r2   string // expected render on RESP2
-		}
-		cells := []cell{
-			{"simple_string_PING", []any{"PING"}, "simple(PONG)", "simple(PONG)"},
-			{"simple_string_SET", []any{"SET", k + ":n", "1"}, "simple(OK)", "simple(OK)"},
-			{"simple_string_status_reply", []any{"EVAL", "return redis.status_reply('FINE')", 0}, "simple(FINE)", "simple(FINE)"},
-			{"integer", []any{"INCR", k + ":max"}, "int(9223372036854775807)", "int(9223372036854775807)"},
-			{"integer_negative", []any{"TTL", k + ":nosuch"}, "int(-2)", "int(-2)"},
-			{"integer_zero", []any{"EXISTS", k + ":nosuch"}, "int(0)", "int(0)"},
-			{"bulk", []any{"GET", k}, "bulk(v)", "bulk(v)"},
-			{"bulk_empty", []any{"GET", k + ":e"}, "bulk()", "bulk()"},
-			{"bulk_unicode", []any{"ECHO", "héllo 世界 🚀"}, "bulk(héllo 世界 🚀)", "bulk(héllo 世界 🚀)"},
-			{"null_bulk", []any{"GET", k + ":nosuch"}, "null", "null"},
-			{"null_array_BLPOP_timeout", []any{"BLPOP", k + ":nosuch", "0.01"}, "null", "null"},
-			{"array", []any{"LRANGE", kl, 0, -1}, "array[bulk(a),bulk(b)]", "array[bulk(a),bulk(b)]"},
-			{"array_empty", []any{"LRANGE", k + ":nosuch", 0, -1}, "array[]", "array[]"},
-			{"array_with_nulls", []any{"MGET", k, k + ":nosuch", k}, "array[bulk(v),null,bulk(v)]", "array[bulk(v),null,bulk(v)]"},
-			{"array_nested", []any{"EVAL", "return {1,{2,{3,'x'}},{}}", 0}, "array[int(1),array[int(2),array[int(3),bulk(x)]],array[]]", "array[int(1),array[int(2),array[int(3),bulk(x)]],array[]]"},
-			{"map", []any{"HGETALL", kh}, "map{bulk(f1)=>bulk(v1),bulk(f2)=>bulk(v2)}", "array[bulk(f1),bulk(v1),bulk(f2),bulk(v2)]"},
-			{"map_int_values", []any{"EVAL", set3 + "return {map={a=1}}", 0}, "map{bulk(a)=>int(1)}", "array[bulk(a),int(1)]"},
-			{"set", []any{"SMEMBERS", ks}, "set[bulk(m1)]", "array[bulk(m1)]"},
-			{"double", []any{"ZSCORE", kz, "x"}, "double(1.5)", "bulk(1.5)"},
-			{"double_script", []any{"EVAL", set3 + "return {double=3.14}", 0}, "double(3.14)", "bulk(3.14)"},
-			{"double_inf", []any{"ZSCORE", kz, "pinf"}, "double(+Inf)", "bulk(inf)"},
-			{"double_neg_inf", []any{"ZSCORE", kz, "ninf"}, "double(-Inf)", "bulk(-inf)"},
-			{"double_in_array_WITHSCORES", []any{"ZRANGE", kz, 0, -1, "WITHSCORES"}, "array[array[bulk(ninf),double(-Inf)],array[bulk(x),double(1.5)],array[bulk(pinf),double(+Inf)]]", "array[bulk(ninf),bulk(-inf),bulk(x),bulk(1.5),bulk(pinf),bulk(inf)]"},
-			{"bool_true", []any{"EVAL", set3 + "return true", 0}, "bool(true)", "int(1)"},
-			{"bool_false", []any{"EVAL", set3 + "return false", 0}, "bool(false)", "int(0)"},
-			{"big_number", []any{"EVAL", set3 + "return {big_number='123456789012345678901234567890'}", 0}, "big(123456789012345678901234567890)", "bulk(123456789012345678901234567890)"},
-			{"big_number_negative", []any{"EVAL", set3 + "return {big_number='-99999999999999999999'}", 0}, "big(-99999999999999999999)", "bulk(-99999999999999999999)"},
-			{"verbatim_string", []any{"EVAL", set3 + "return {verbatim_string={string='hello', format='txt'}}", 0}, "verbatim(txt:hello)", "bulk(hello)"},
-		}
+		cells := rtReplyCells(k)
 		for _, cl := range cells {
 			t.Run(cl.name, func(t *testing.T) {
 				v, err := c.Do(ctx, cl.args...)
@@ -212,6 +223,15 @@ func TestRESPReplyTypes(t *testing.T) {
 	})
 }
 
+// rtBulkSizes are the bulk value sizes TestRESPLargeAndBinaryBulk always runs.
+var rtBulkSizes = []int{1<<20 - 1, 1 << 20, 1<<20 + 1, 3<<20 + 13}
+
+// rtBulkSizesOverLinuxCap are the sizes that fail today (R3), so they run only
+// with the redisrtbugs tag: on Linux the event loop caps one outbound write at
+// 4 MiB (driver/internal/eventloop maxPendingBytes), so a SET of a value of
+// 4 MiB or more fails with ErrQueueFull; Redis takes 512 MiB.
+var rtBulkSizesOverLinuxCap = []int{4<<20 + 13, 17 << 20}
+
 // TestRESPLargeAndBinaryBulk: a bulk reply larger than the reader's 1 MiB
 // inline limit is copied out of the buffer, and CRLF, '$' and '+' inside a
 // bulk must not be taken for framing.
@@ -227,12 +247,9 @@ func TestRESPLargeAndBinaryBulk(t *testing.T) {
 		}
 		framing := append(append([]byte{}, all...), "\r\n$5\r\nhello\r\n+OK\r\n:1\r\n*1\r\n"...)
 		payloads := map[string][]byte{"all_bytes_and_framing": framing}
-		sizes := []int{1<<20 - 1, 1 << 20, 1<<20 + 1, 3<<20 + 13}
+		sizes := append([]int{}, rtBulkSizes...)
 		if rtKnownBugs {
-			// R3: on Linux the event loop caps one outbound write at 4 MiB
-			// (driver/internal/eventloop maxPendingBytes), so a SET of a value
-			// of 4 MiB or more fails with ErrQueueFull; Redis takes 512 MiB.
-			sizes = append(sizes, 4<<20+13, 17<<20)
+			sizes = append(sizes, rtBulkSizesOverLinuxCap...)
 		}
 		for _, n := range sizes {
 			payloads["size_"+strconv.Itoa(n)] = bytes.Repeat([]byte("0123456789abcdef\r\n"), n/18+1)[:n]
@@ -269,23 +286,25 @@ func TestRESPLargeAndBinaryBulk(t *testing.T) {
 	})
 }
 
-// TestRESPTypedHelpers: the typed helpers read the same reply the same way on
-// either protocol. Each row is a script whose reply is one RESP3 type; the
-// expectation is what RESP2 (the server's own downgrade) gives, and RESP3 must
-// agree. "ERR" means the helper returns an error.
-func TestRESPTypedHelpers(t *testing.T) {
+const (
+	bStr   = "R1 DoString/DoInt on a RESP3 double, bool or big number returns an error where RESP2 returns the value"
+	bSlice = "R2 DoSlice turns every non-bulk element (integer, double, bool, nested array) into an empty string"
+	bMap   = "R1 DoSlice on a RESP3 map returns an error where RESP2 returns the flat array"
+)
+
+// rtHelperRow is one reply, read through the typed helpers of Client: what each of DoString,
+// DoInt, DoBool and DoSlice must give ("ERR" when the helper must return an
+// error: the reply is not of its kind).
+type rtHelperRow struct {
+	name, script                 string
+	str, integer, boolean, slice string // "ERR" or the expected rendering; slice is joined with "|"
+	bug3, bug2                   string // known bug on RESP3 / on RESP2: the cell is run only with redisrtbugs
+}
+
+// rtHelperRows lists the rows TestRESPTypedHelpers runs.
+func rtHelperRows() []rtHelperRow {
 	const set3 = "redis.setresp(3); "
-	type row struct {
-		name, script                 string
-		str, integer, boolean, slice string // "ERR" or the expected rendering; slice is joined with "|"
-		bug3, bug2                   string // known bug on RESP3 / on RESP2: the cell is run only with redisrtbugs
-	}
-	const (
-		bStr   = "R1 DoString/DoInt on a RESP3 double, bool or big number returns an error where RESP2 returns the value"
-		bSlice = "R2 DoSlice turns every non-bulk element (integer, double, bool, nested array) into an empty string"
-		bMap   = "R1 DoSlice on a RESP3 map returns an error where RESP2 returns the flat array"
-	)
-	rows := []row{
+	return []rtHelperRow{
 		{name: "bulk", script: "return 'bulk'", str: "bulk", integer: "ERR", boolean: "ERR", slice: "ERR"},
 		{name: "integer", script: "return 7", str: "7", integer: "7", boolean: "true", slice: "ERR"},
 		{name: "status", script: "return redis.status_reply('FINE')", str: "FINE", integer: "ERR", boolean: "ERR", slice: "ERR"},
@@ -299,6 +318,14 @@ func TestRESPTypedHelpers(t *testing.T) {
 		{name: "array_of_int", script: "return {1,2}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "1|2", bug3: bSlice, bug2: bSlice},
 		{name: "map_flat_on_resp2", script: set3 + "return {map={a=1}}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "a|1", bug3: bMap + "; " + bSlice, bug2: bSlice},
 	}
+}
+
+// TestRESPTypedHelpers: the typed helpers read the same reply the same way on
+// either protocol. Each row is a script whose reply is one RESP3 type; the
+// expectation is what RESP2 (the server's own downgrade) gives, and RESP3 must
+// agree. "ERR" means the helper returns an error.
+func TestRESPTypedHelpers(t *testing.T) {
+	rows := rtHelperRows()
 	rtClients(t, func(t *testing.T, c *celredis.Client, resp int) {
 		ctx := ctxWithTimeout(t, 20*time.Second)
 		show := func(s string, err error) string {
