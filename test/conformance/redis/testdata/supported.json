@@ -182,20 +182,13 @@
         {
           "id": "helpers-double",
           "label": "Double (RESP3)",
-          "works": [],
+          "works": [
+            "DoString"
+          ],
           "by_design": [
             "DoInt",
             "DoBool",
             "DoSlice"
-          ],
-          "fails": [
-            {
-              "dest": "DoString",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -205,26 +198,12 @@
           "id": "helpers-bool-true",
           "label": "Boolean true (RESP3)",
           "works": [
+            "DoString",
+            "DoInt",
             "DoBool"
           ],
           "by_design": [
             "DoSlice"
-          ],
-          "fails": [
-            {
-              "dest": "DoString",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            },
-            {
-              "dest": "DoInt",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -234,26 +213,12 @@
           "id": "helpers-bool-false",
           "label": "Boolean false (RESP3)",
           "works": [
+            "DoString",
+            "DoInt",
             "DoBool"
           ],
           "by_design": [
             "DoSlice"
-          ],
-          "fails": [
-            {
-              "dest": "DoString",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            },
-            {
-              "dest": "DoInt",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -262,20 +227,13 @@
         {
           "id": "helpers-big-number",
           "label": "Big number (RESP3)",
-          "works": [],
+          "works": [
+            "DoString"
+          ],
           "by_design": [
             "DoInt",
             "DoBool",
             "DoSlice"
-          ],
-          "fails": [
-            {
-              "dest": "DoString",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -329,21 +287,13 @@
         {
           "id": "helpers-array-of-int",
           "label": "Array of integers (an EVAL reply)",
-          "works": [],
+          "works": [
+            "DoSlice"
+          ],
           "by_design": [
             "DoString",
             "DoInt",
             "DoBool"
-          ],
-          "fails": [
-            {
-              "dest": "DoSlice",
-              "gap": "R2",
-              "scope": [
-                "resp2",
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -352,28 +302,13 @@
         {
           "id": "helpers-map-flat-on-resp2",
           "label": "Map (RESP3), a flat array on RESP2",
-          "works": [],
+          "works": [
+            "DoSlice"
+          ],
           "by_design": [
             "DoString",
             "DoInt",
             "DoBool"
-          ],
-          "fails": [
-            {
-              "dest": "DoSlice",
-              "gap": "R1",
-              "scope": [
-                "resp3"
-              ]
-            },
-            {
-              "dest": "DoSlice",
-              "gap": "R2",
-              "scope": [
-                "resp2",
-                "resp3"
-              ]
-            }
           ],
           "covers": [
             "TestRESPTypedHelpers"
@@ -479,17 +414,6 @@
     }
   ],
   "gaps": [
-    {
-      "id": "R1",
-      "release": "v1.6.0",
-      "summary": "On RESP3 (the default), `DoString` and `DoInt` fail on a double, boolean or big number reply, and `DoSlice` fails on a map reply, where RESP2 returns the value.",
-      "error": "celeris-redis: expected string reply, got double"
-    },
-    {
-      "id": "R2",
-      "release": "v1.6.0",
-      "summary": "`DoSlice` returns an empty string for every element that is an integer, a double, a boolean or a nested array."
-    },
     {
       "id": "R3",
       "release": "v1.6.0",
