@@ -205,9 +205,40 @@ jobs:
         run: >-
           go test -tags 'postgres pgbouncer' -race -count=1 -timeout=300s
           -v -run TestPgBouncer ./test/conformance/postgres/
+      # PgBouncer without prepared-statement support (max_prepared_statements=0,
+      # transaction mode, pool_size=2, port 6433; pgbouncer-noprep/pgbouncer.ini).
+      # It shares two server connections between every client and does not track
+      # named statements. The driver's way out there is auto_cache_statements=false
+      # (TestPgBouncerNoPrepWayOut: no error and no wrong statement); with the
+      # default DSN a call can fail with 26000 or 42P05, and must never run a
+      # statement its own connection did not prepare (TestPgBouncerNoPrep, see
+      # celeris#1455). Both start client processes of this test binary.
+      - name: Start PgBouncer without prepared-statement support
+        run: |
+          docker run -d --name pgbouncer-noprep --network host \
+            -v "$PWD/test/conformance/postgres/pgbouncer-noprep:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer:v1.26.1-p0
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/6433) 2>/dev/null; then
+              echo "pgbouncer-noprep is listening"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "pgbouncer-noprep never listened"
+          docker logs pgbouncer-noprep
+          exit 1
+      - name: PgBouncer without prepared-statement support
+        env:
+          CELERIS_PGBOUNCER_NOPREP_DSN: postgres://celeris:celeris@127.0.0.1:6433/celeris_txn?sslmode=disable
+        run: >-
+          go test -tags 'postgres pgbouncer' -race -count=1 -timeout=300s
+          -v -run 'TestPgBouncerNoPrep' ./test/conformance/postgres/
       - name: Dump PgBouncer log on failure
         if: failure()
-        run: docker logs pgbouncer 2>&1 | tail -60
+        run: |
+          docker logs pgbouncer 2>&1 | tail -60
+          docker logs pgbouncer-noprep 2>&1 | tail -60
 
   # ------------------------------------------------------------------
   # Redis matrix
