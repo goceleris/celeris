@@ -170,6 +170,16 @@ func appendEscapedByte(dst []byte, b byte) []byte {
 // the number of rows imported (parsed from the server's CommandComplete tag)
 // or any transport / iteration error. Column names may be empty to default
 // to the table's natural column order.
+//
+// Cancellation. A ctx that ends while the call waits for the server to accept
+// the COPY (its CopyInResponse) closes the connection (the pool replaces it) and
+// returns the context's error; no row was written. A ctx that ends later, once
+// the server accepted the COPY, can return an error although the COPY
+// committed: the call returns ctx.Err() on one path and the server's
+// cancellation error (a *PGError, SQLSTATE 57014, which does not match
+// errors.Is(err, context.DeadlineExceeded)) on another, and the server may
+// already have committed the rows. Do not retry a CopyFrom that returned a
+// context error without checking the table: a retry can duplicate rows.
 func (p *Pool) CopyFrom(ctx context.Context, tableName string, columns []string, src CopyFromSource) (int64, error) {
 	c, err := p.acquire(ctx)
 	if err != nil {

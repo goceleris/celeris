@@ -3348,7 +3348,8 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		// The context ended before the server's CopyInResponse. A CancelRequest
+		// The context ended while the call waited for the CopyInResponse (which
+		// may even have arrived: with both ready, select can take ctx). A CancelRequest
 		// is no way out: the statement may not be running yet, and when it
 		// starts after the cancel was dropped the server waits in COPY IN for
 		// data that this call, which is returning, will never send; nothing then

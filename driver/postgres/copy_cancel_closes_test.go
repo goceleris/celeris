@@ -1,6 +1,6 @@
 package postgres
 
-// A COPY FROM whose context ends before the server's CopyInResponse returns the
+// A COPY FROM whose context ends while it waits for the CopyInResponse returns the
 // context's error at once and closes the connection (copyFrom): a server that
 // has not answered, or that answers later and waits in COPY IN for data, is not
 // waited for, and the conn is not reused with its COPY in an unknown state.
