@@ -32,7 +32,11 @@ var allCopyKinds = []copyKind{copyComplete, copyMid, copyAfterLast, copyAfterDon
 
 func copyServer(tb testing.TB, kind copyKind, n int, rst bool) func(net.Conn) {
 	cut := func(c net.Conn) {
-		time.Sleep(20 * time.Millisecond)
+		// A complete COPY is followed by the close at once; the others get a pause so
+		// that the bytes written before the close are read before it.
+		if kind != copyComplete {
+			time.Sleep(20 * time.Millisecond)
+		}
 		lossCfg{rst: rst}.cut(c)
 	}
 	return func(c net.Conn) {
@@ -136,9 +140,6 @@ func TestConnLossCopyIsNotSuccess(t *testing.T) {
 			for _, n := range []int{50, 500} {
 				for _, kind := range allCopyKinds {
 					for _, rst := range []bool{false, true} {
-						if rst && kind == copyComplete {
-							continue
-						}
 						cut := "FIN"
 						if rst {
 							cut = "RST"

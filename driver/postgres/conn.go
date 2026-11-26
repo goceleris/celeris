@@ -279,6 +279,22 @@ func (r *pgRequest) fail(err error) {
 	r.finished.Store(true)
 }
 
+// pollFinished reports whether the request a sync poll ran finished with its
+// ReadyForQuery before the poll's error (the end of the connection, read after
+// the reply) was returned. Such a request is a complete result, not a failed one:
+// it was popped and finished by dispatch (doneFlag, no error; a failAll sets the
+// error), so the caller keeps its result. The connection is marked closed so the
+// pool discards it and the next call gets the connection-loss error.
+func (c *pgConn) pollFinished(req *pgRequest) bool {
+	req.doneMu.Lock()
+	ok := req.doneFlag && req.err == nil
+	req.doneMu.Unlock()
+	if ok {
+		c.closed.Store(true)
+	}
+	return ok
+}
+
 // failedErr returns the error a sync poll's caller gives back for a request the
 // poll failed: the error r was failed with (the first fail's: a failAll that the
 // same poll triggered, because the loop's onClose runs inside WriteAndPoll, sets
@@ -2383,10 +2399,15 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			err = req.failedErr(err)
-			releasePgRequest(req)
-			return nil, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return nil, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2548,10 +2569,15 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			err = req.failedErr(err)
-			releasePgRequest(req)
-			return "", 0, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return "", 0, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2635,10 +2661,15 @@ func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback b
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			err = req.failedErr(err)
-			releasePgRequest(req)
-			return false, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return false, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2771,10 +2802,15 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		protocol.AppendSync(c.writer)
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
-			c.failReq(req, werr)
-			werr = req.failedErr(werr)
-			releasePgRequest(req)
-			return nil, werr
+			if !c.pollFinished(req) {
+				c.failReq(req, werr)
+				werr = req.failedErr(werr)
+				releasePgRequest(req)
+				return nil, werr
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2879,10 +2915,15 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendSync(c.writer)
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
-			c.failReq(req, werr)
-			werr = req.failedErr(werr)
-			releasePgRequest(req)
-			return nil, werr
+			if !c.pollFinished(req) {
+				c.failReq(req, werr)
+				werr = req.failedErr(werr)
+				releasePgRequest(req)
+				return nil, werr
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {

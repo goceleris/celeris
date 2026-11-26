@@ -142,8 +142,8 @@ func lossServer(tb testing.TB, cfg lossCfg) func(net.Conn) {
 					add(protocol.BackendCommandComplete, append([]byte(tag), 0))
 					add(protocol.BackendReadyForQuery, []byte{status})
 					flush()
-					// A FIN after the reply: the connection closes, the result is complete.
-					time.Sleep(20 * time.Millisecond)
+					// The connection closes at once after the reply, FIN or RST, with no
+					// pause: the result is complete (ReadyForQuery was sent) and stays so.
 					cfg.cut(c)
 					return true
 				case lossAfterC:
@@ -523,9 +523,6 @@ func TestConnLossIsNotEOF(t *testing.T) {
 				for _, n := range []int{50, 500} {
 					for _, kind := range allLossKinds {
 						for _, rst := range []bool{false, true} {
-							if rst && (kind == lossComplete) {
-								continue
-							}
 							proto := "simple"
 							if ext {
 								proto = "extended"
