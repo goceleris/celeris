@@ -2111,10 +2111,9 @@ func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
 // Err (the clock decides, as in driveDirect). It runs on a successful
 // auto-prepare, and on a successful re-prepare after the server lost a cached
 // statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
-// the statement was being prepared (a direct conn sees a cancel-only context
-// only when bytes arrive, so a prepare can finish under a context that has
-// already been cancelled) must not go on to send, and possibly commit, the
-// statement.
+// the statement was being prepared (the prepare can finish under a context that
+// has already been cancelled, for instance when the cancel lands as the reply
+// does) must not go on to send, and possibly commit, the statement.
 func ctxEndedErr(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -34,10 +34,10 @@ import (
 // stalled Parse then gets 57014 + ReadyForQuery, as a real backend answers a
 // cancel; without it every cancel socket stays open, so the cancel exchange of
 // the ended context cannot be confirmed. With notices set it sends a
-// NoticeResponse every 20 ms after a Parse, as a backend does while it works: a
-// Pool conn in direct mode looks at a cancel-only context only when bytes
-// arrive, so these are what let it see the cancel. It counts the messages the
-// client sent: parses, binds and executes (the user's statement).
+// NoticeResponse every 20 ms after a Parse, as a backend does while it works (a
+// conn that looks at its context when bytes arrive sees the cancel then). It
+// counts the messages the client sent: parses, binds and executes (the user's
+// statement).
 type parseStallPG struct {
 	addr    string
 	notices bool
@@ -333,13 +333,18 @@ func TestPrepareEndedByTheContextReportsTheContextError(t *testing.T) {
 	}
 }
 
-// A prepare that FINISHES under a context that ended while it ran (a Pool conn
-// in direct mode looks at a cancel-only context only when bytes arrive, so the
-// prepare's reply is what ends its wait) must not go on to send the statement.
+// A prepare whose context is cancelled while the backend is still answering it
+// must not go on to send the statement. On a Pool conn in direct mode the cancel
+// wakes the blocked read (the watch of cancel.go): the cancel exchange is
+// confirmed (confirm), the drain reads the prepare's reply, which the backend
+// sends after 100 ms by itself, and the conn is reused. (Before the watch, a
+// cancel-only context was seen only when the reply arrived, so the prepare
+// finished under an ended context; that is now the narrow race of the cancel
+// landing as the reply does, which no test here forces.)
 func TestPrepareFinishedUnderAnEndedContextDoesNotSendTheStatement(t *testing.T) {
 	for _, kind := range []string{"exec", "query"} {
 		t.Run(kind, func(t *testing.T) {
-			f := startParseStallPG(t, false, false)
+			f := startParseStallPG(t, false, true)
 			f.answerPrepare = 100 * time.Millisecond
 			run := prepareArms()[0].open(t, f.addr) // pool-direct
 			ctx, stop := context.WithCancel(context.Background())
@@ -348,7 +353,7 @@ func TestPrepareFinishedUnderAnEndedContextDoesNotSendTheStatement(t *testing.T)
 				select {
 				case <-f.parseCh:
 					// The conn is in its blocking read by now (the reply comes after
-					// 100 ms): the cancel is not seen until the reply arrives.
+					// 100 ms): the cancel wakes it.
 					time.Sleep(30 * time.Millisecond)
 					stop()
 				case <-f.done:
@@ -371,7 +376,7 @@ func TestPrepareFinishedUnderAnEndedContextDoesNotSendTheStatement(t *testing.T)
 				t.Fatalf("the backend got %d Parse, %d Bind, %d Execute; want 1, 0, 0: the statement was sent after its context ended", p, b, e)
 			}
 			if got := f.sessions(); got != 1 {
-				t.Fatalf("sessions = %d, want 1: the conn finished the prepare and is reusable", got)
+				t.Fatalf("sessions = %d, want 1: the cancel exchange was confirmed and the drain read the prepare's reply, so the conn is reusable", got)
 			}
 		})
 	}
