@@ -279,3 +279,59 @@ func TestLoopWithoutAnEventfdNeverTakesTheLongWait1381(t *testing.T) {
 		t.Errorf("a loop without an eventfd made %d sweeps in 1 s, want at least 25", after-before)
 	}
 }
+
+// TestSetSweepPeriodRecordsTheTimerOnlyOnceItIsArmed1381: a re-arm that fails is
+// not recorded, so the loop tries again at its next iteration; a loop that holds
+// a connection is never left on a 100 ms timer it believes is 25 ms. The syscall
+// is the package's timerfdSettime seam, so no kernel failure is needed.
+func TestSetSweepPeriodRecordsTheTimerOnlyOnceItIsArmed1381(t *testing.T) {
+	old := timerfdSettime
+	t.Cleanup(func() { timerfdSettime = old })
+	var calls int
+	var lastInterval unix.Timespec
+	fail := true
+	timerfdSettime = func(_ int, _ int, spec *unix.ItimerSpec, _ *unix.ItimerSpec) error {
+		calls++
+		lastInterval = spec.Interval
+		if fail {
+			return unix.EINVAL
+		}
+		return nil
+	}
+	l := &Loop{timerFD: 4}
+	l.setSweepPeriod(true)
+	if l.timerSlow || calls != 1 {
+		t.Fatalf("slow re-arm that failed: timerSlow %v after %d calls, want false after 1 (not recorded)", l.timerSlow, calls)
+	}
+	fail = false
+	l.setSweepPeriod(true)
+	if !l.timerSlow || lastInterval.Nsec != 100*1e6 {
+		t.Fatalf("slow re-arm: timerSlow %v, interval %v, want true and 100 ms", l.timerSlow, lastInterval)
+	}
+	fail = true
+	l.setSweepPeriod(false)
+	if !l.timerSlow {
+		t.Fatal("a fast re-arm that failed was recorded: the loop would keep its 100 ms timer believing it is 25 ms")
+	}
+	fail = false
+	l.setSweepPeriod(false)
+	if l.timerSlow || lastInterval.Nsec != 25*1e6 {
+		t.Fatalf("fast re-arm: timerSlow %v, interval %v, want false and 25 ms", l.timerSlow, lastInterval)
+	}
+}
+
+// TestSetSweepPeriodLeavesATimerATestDisarmedAlone1381: a loop already on the slow
+// timer whose timer a test has disarmed by hand (idleWaitOff) is not re-armed at
+// 25 ms by its next top of iteration.
+func TestSetSweepPeriodLeavesATimerATestDisarmedAlone1381(t *testing.T) {
+	old := timerfdSettime
+	t.Cleanup(func() { timerfdSettime = old })
+	calls := 0
+	timerfdSettime = func(int, int, *unix.ItimerSpec, *unix.ItimerSpec) error { calls++; return nil }
+	l := &Loop{timerFD: 4, timerSlow: true}
+	l.idleWaitOff.Store(true)
+	l.setSweepPeriod(false)
+	if calls != 0 || l.timerSlow {
+		t.Fatalf("a hand-disarmed timer was re-armed (%d calls) or still recorded slow (%v)", calls, l.timerSlow)
+	}
+}

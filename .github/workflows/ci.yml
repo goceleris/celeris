@@ -2751,6 +2751,8 @@ jobs:
             TestSweepTimerFollowsWhatTheLoopHolds1381
             TestTransplantDrainTakesTheLoopOffTheLongWait1381
             TestLoopWithoutAnEventfdNeverTakesTheLongWait1381
+            TestSetSweepPeriodRecordsTheTimerOnlyOnceItIsArmed1381
+            TestSetSweepPeriodLeavesATimerATestDisarmedAlone1381
           )
           iouring=(
             TestIdleWorkerWakeupsAreBounded1381

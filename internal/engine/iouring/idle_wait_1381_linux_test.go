@@ -137,10 +137,13 @@ func ok1381(t *testing.T, addr string) time.Duration {
 }
 
 // An idle worker blocks at most idleWakeBound1381 times a second. Before the
-// change an idle io_uring worker woke 54 to 62 times a second (measured on CI,
-// both architectures: the 25 ms cap and what else wakes it), after it fewer. The
-// bound sits between them, nearer the 54.
-const idleWakeBound1381 = 35
+// change an idle io_uring worker woke 54 to 62 times a second with two workers
+// and 41 with the one worker the Unit job's 8 MiB memlock funds (measured on CI,
+// both architectures: the 25 ms cap is 40 a second, and what else wakes it), after
+// it 10 to 16. The bound is the one the failing-first run used and saw main's code
+// fail: 1.6 times under main's single-worker figure and 1.6 times over the fix's
+// worst.
+const idleWakeBound1381 = 25
 
 // TestIdleWorkerWakeupsAreBounded1381 fails before the change.
 func TestIdleWorkerWakeupsAreBounded1381(t *testing.T) {

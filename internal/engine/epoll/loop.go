@@ -3230,14 +3230,15 @@ func (l *Loop) initProtocol(cs *connState) {
 			if !l.async && l.wakeFD.FD() < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 				if err == nil {
-					// celeris#655: Set refuses once shutdown closed the handle,
-					// and then this descriptor is ours to close.
-					if l.wakeFD.Set(efd) {
-						_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
-							Events: unix.EPOLLIN | unix.EPOLLET,
-							Fd:     int32(efd),
-						})
-					} else {
+					// The descriptor is in the epoll set before the handle holds it: a
+					// loop whose handle holds a descriptor that is in no epoll set would
+					// take the long wait (idle_wait_1381.go) with no wake that reaches it
+					// (celeris#1381). celeris#655: Set refuses once shutdown closed the
+					// handle, and then this descriptor is ours to close.
+					if unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+						Events: unix.EPOLLIN | unix.EPOLLET,
+						Fd:     int32(efd),
+					}) != nil || !l.wakeFD.Set(efd) {
 						_ = unix.Close(efd)
 					}
 				}
@@ -4128,14 +4129,15 @@ func (l *Loop) drainDetachQueue() {
 			if l.wakeFD.FD() < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 				if err == nil {
-					// celeris#655: Set refuses once shutdown closed the handle,
-					// and then this descriptor is ours to close.
-					if l.wakeFD.Set(efd) {
-						_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
-							Events: unix.EPOLLIN | unix.EPOLLET,
-							Fd:     int32(efd),
-						})
-					} else {
+					// The descriptor is in the epoll set before the handle holds it: a
+					// loop whose handle holds a descriptor that is in no epoll set would
+					// take the long wait (idle_wait_1381.go) with no wake that reaches it
+					// (celeris#1381). celeris#655: Set refuses once shutdown closed the
+					// handle, and then this descriptor is ours to close.
+					if unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+						Events: unix.EPOLLIN | unix.EPOLLET,
+						Fd:     int32(efd),
+					}) != nil || !l.wakeFD.Set(efd) {
 						_ = unix.Close(efd)
 					}
 				}

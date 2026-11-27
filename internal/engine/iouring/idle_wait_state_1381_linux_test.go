@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/internal/wakefd"
@@ -72,9 +73,12 @@ func TestIdleWaitOfAWorkerThatHoldsNothing1381(t *testing.T) {
 		{"a driver connection registered", func(w *Worker) { w.hasDriverConns.Store(true) }},
 		{"a driver action queued (register, write, adopt)", func(w *Worker) { w.driverActionPending.Store(1) }},
 		{"the detach queue not empty", func(w *Worker) { w.detachQPending.Store(1) }},
+		{"a pause linger running", func(w *Worker) { w.lingerUntil = deferlinger.After(time.Second) }},
 		{"a request count not flushed", func(w *Worker) { w.reqBatch = 1 }},
 		{"received bytes not flushed", func(w *Worker) { w.bytesReadBatch = 1 }},
 		{"sent bytes not flushed", func(w *Worker) { w.bytesWrittenBatch = 1 }},
+		{"ring-sent bytes not flushed", func(w *Worker) { w.ringBytesBatch = 1 }},
+		{"send-to-recv chains not flushed", func(w *Worker) { w.linkArmBatch = 1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := quiescentWorker1381(t)

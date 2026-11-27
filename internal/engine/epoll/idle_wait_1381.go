@@ -71,12 +71,21 @@ func (l *Loop) idleQuiescent(ctx context.Context) bool {
 		ctx.Err() == nil
 }
 
+// timerfdSettime is unix.TimerfdSettime; a test replaces it to fail the re-arm.
+var timerfdSettime = unix.TimerfdSettime
+
 // setSweepPeriod arms the sweep timerfd at the idle period (slow) or at
-// sweepFloor, and records which. The loop thread, at the top of an iteration,
-// before it waits. A failed re-arm is not an error: the loop then waits on its
-// timeout alone, which is bounded the same.
+// sweepFloor, and records which once the timer is armed. The loop thread, at
+// the top of an iteration, before it waits. A re-arm that fails is not recorded,
+// so the next iteration tries again (the loop meanwhile waits on its timeout
+// alone, which is bounded the same, and a loop that holds a connection is not
+// left believing its timer is at sweepFloor). A loop whose timer a test has
+// disarmed by hand is left as it is (idleWaitOff).
 func (l *Loop) setSweepPeriod(slow bool) {
-	l.timerSlow = slow
+	if !slow && l.idleWaitOff.Load() {
+		l.timerSlow = false
+		return
+	}
 	p := int64(sweepFloor)
 	if slow {
 		p = idleWaitMs * int64(time.Millisecond)
@@ -85,5 +94,7 @@ func (l *Loop) setSweepPeriod(slow bool) {
 		Interval: unix.Timespec{Sec: p / int64(time.Second), Nsec: p % int64(time.Second)},
 		Value:    unix.Timespec{Sec: p / int64(time.Second), Nsec: p % int64(time.Second)},
 	}
-	_ = unix.TimerfdSettime(l.timerFD, 0, &spec, nil)
+	if timerfdSettime(l.timerFD, 0, &spec, nil) == nil {
+		l.timerSlow = slow
+	}
 }
