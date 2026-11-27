@@ -33,7 +33,7 @@ const driverRecvBufSize = 4 * 1024
 
 // driverSendCap is the per-FD outbound backpressure limit. Writes past this
 // return engine.ErrQueueFull so the driver can back off its producer.
-const driverSendCap = 64 << 20
+const driverSendCap = engine.DriverWriteLimit
 
 // driverConn holds per-FD state for an EventLoopProvider-registered FD.
 // Separate from connState because the HTTP path has invariants (protocol
@@ -317,6 +317,9 @@ func (w *Worker) Write(fd int, data []byte) error {
 	}
 	if len(dc.writeBuf)+len(dc.sendBuf)+len(data) > driverSendCap {
 		dc.mu.Unlock()
+		if len(data) > driverSendCap {
+			return &engine.WriteTooLargeError{Size: len(data), Limit: driverSendCap}
+		}
 		return engine.ErrQueueFull
 	}
 	dc.writeBuf = append(dc.writeBuf, data...)

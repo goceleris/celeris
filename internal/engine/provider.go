@@ -1,11 +1,41 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 // ErrQueueFull is returned by [WorkerLoop.Write] when the worker's outbound
 // queue is full and cannot accept more data without blocking. Callers should
 // apply backpressure to their data source rather than retry in a tight loop.
 var ErrQueueFull = errors.New("celeris/engine: worker write queue full")
+
+// DriverWriteLimit is the largest number of bytes a driver connection may
+// have pending in a worker's outbound queue, and so the largest single
+// [WorkerLoop.Write] that can ever succeed, on every Linux path: the
+// standalone driver loop, the epoll engine and the io_uring engine. A write
+// above it is refused with a [*WriteTooLargeError]; the drivers do not split
+// it (celeris#1357).
+const DriverWriteLimit = 64 << 20 // 64 MiB
+
+// WriteTooLargeError is returned by [WorkerLoop.Write] (and the WriteAndPoll
+// variants) for a single write of Size bytes that exceeds Limit, the largest
+// write the worker accepts. Unlike a queue that is merely busy, retrying
+// cannot succeed: the caller has to send less. It satisfies
+// errors.Is(err, [ErrQueueFull]), so code that matches that sentinel keeps
+// working.
+type WriteTooLargeError struct {
+	Size  int // bytes the caller tried to write in one call
+	Limit int // largest write the worker accepts
+}
+
+func (e *WriteTooLargeError) Error() string {
+	return "celeris/engine: write of " + strconv.Itoa(e.Size) +
+		" bytes exceeds the per-write limit of " + strconv.Itoa(e.Limit>>20) + " MiB"
+}
+
+// Unwrap makes errors.Is(e, ErrQueueFull) true.
+func (e *WriteTooLargeError) Unwrap() error { return ErrQueueFull }
 
 // ErrUnknownFD is returned when a [WorkerLoop] operation references a file
 // descriptor that is not registered on that worker. [WorkerLoop.Write] also
