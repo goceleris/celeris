@@ -1195,6 +1195,32 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	return res
 }
 
+// NextDeadline is the earliest time at which Sweep has something to do for this
+// connection, or 0 when it knows of none: the earliest of the four deadline
+// hints (a hint at or before now is owed, and is returned as it is), and the end
+// of the idle period (the last stream activity the idle clock saw, plus
+// IdleTimeout) when that is still ahead of now. It does not name the 100 ms
+// look at the idle clock: that look is made by whatever sweep comes, and a
+// deadline that waited for it would make every connection due ten times a
+// second. Atomic loads and two plain reads of the loop thread's own fields:
+// called from the loop thread, after Sweep or after the frames of a read, by the
+// engine that sets its next sweep from it (celeris#1430).
+func (s *H2State) NextDeadline(now int64) int64 {
+	h := &s.hints
+	var next int64
+	for _, t := range [...]int64{h.ReqDL.Load(), h.TombDL.Load(), h.HdrDL.Load(), h.WrDL.Load()} {
+		if t != 0 && (next == 0 || t < next) {
+			next = t
+		}
+	}
+	if s.idleNs > 0 && s.d0At != 0 {
+		if t := s.d0At + s.idleNs + 1; t > now && (next == 0 || t < next) {
+			next = t
+		}
+	}
+	return next
+}
+
 // ExtendIdle is the engine's answer to CloseNow when the connection still holds
 // output (it has bytes in its buffers or in the kernel's send queue). Output that
 // is going out is not idle, so the idle period restarts at now, at once, and

@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/mono"
 )
 
@@ -40,11 +41,121 @@ const (
 // 1024 iterations of 100 ms still sweeps about every second. A sweep the
 // worker was told to make by its standing timer (sweepTickFired) is made
 // whatever the clock says; so is one after the clock stepped back (d < 0), or
-// the sweep would wait for the clock to catch up. Worker thread; the caller
-// reads the clock only when it has no batch clock to use.
+// the sweep would wait for the clock to catch up. A sweep is also made when the
+// last one found a deadline falling due now (dueNow, celeris#1430): that is
+// added to the sweeps above, none of which is removed. Worker thread; the
+// caller reads the clock only when it has no batch clock to use.
 func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 	d := now - w.lastSweep
-	return d >= sweepCeiling || d < 0 || w.sweepTickFired || (gateHit && d >= sweepFloor)
+	return d >= sweepCeiling || d < 0 || w.sweepTickFired || (gateHit && d >= sweepFloor) || w.dueNow(now)
+}
+
+// The next look (celeris#1430). Each timeout sweep works out the earliest time at
+// which a connection's deadline could fall due (nextDue), and the loop sweeps
+// then, as well as at the sweeps it made before: the gate, the ceiling, the
+// standing timer. None of those is removed, so a deadline the computation does
+// not know (a connection inside an async handler, one exempt from a timeout, an
+// HTTP/2 deadline lowered from a pool goroutine, a WebSocket deadline moved by
+// the middleware) is met at the sweeps' own period, as it was, and never later.
+// Three rules bound what the computation costs:
+//
+//   - nextDue is never sooner than sweepFloor after the last sweep (dueTime), so
+//     the sweeps the computation adds are at most the 40 a second of the floor;
+//   - it is never more than sweepCeiling after the sweep that computed it
+//     (finishDue), so a stale value is at most a second of an early look;
+//   - a deadline that is already past after a sweep contributes nothing (dueAt):
+//     the sweep either closed the connection or left it to the sweeps' period (a
+//     connection exempt from a timeout, or one whose lock was held). A sweep that
+//     wants the next look soon says so with now plus the floor.
+//
+// The sites that arm a deadline, and the sweeps' own reads of the clocks, are
+// listed by a test (sweep_due_sites_1430_linux_test.go) that parses them. Every
+// one runs on the worker's thread, which is what nextDue is owned by.
+
+// dueAt lowers the next look to t, when t is ahead of now. 0 is "none known".
+func (w *Worker) dueAt(t, now int64) {
+	if t > now && (w.nextDue == 0 || t < w.nextDue) {
+		w.nextDue = t
+	}
+}
+
+// dueTime is when the next look is owed, no sooner than the floor after the
+// last sweep, or 0 when none is known.
+func (w *Worker) dueTime() int64 {
+	if w.nextDue == 0 {
+		return 0
+	}
+	return max(w.nextDue, w.lastSweep+sweepFloor)
+}
+
+// dueNow reports whether the next look is owed at now.
+func (w *Worker) dueNow(now int64) bool {
+	t := w.dueTime()
+	return t != 0 && now >= t
+}
+
+// dueWait is the time left to the next look, never below zero, and whether one is
+// known. It reads the clock: it is for the waits, not for the sweep's loop.
+func (w *Worker) dueWait() (time.Duration, bool) {
+	t := w.dueTime()
+	if t == 0 {
+		return 0, false
+	}
+	return time.Duration(max(t-mono.Now(), 0)), true
+}
+
+// dueCap caps a ring wait at the time left to the next look.
+func (w *Worker) dueCap(d time.Duration) time.Duration {
+	if left, ok := w.dueWait(); ok && left < d {
+		return left
+	}
+	return d
+}
+
+// finishDue ends a sweep's computation: no sooner than the floor is applied
+// where nextDue is read (dueTime); no later than the ceiling is applied here,
+// and a sweep that found no deadline to wait for leaves the ceiling.
+func (w *Worker) finishDue(now int64) {
+	if w.nextDue == 0 || w.nextDue > now+sweepCeiling {
+		w.nextDue = now + sweepCeiling
+	}
+}
+
+// dueIdleFrom lowers the next look to when a connection whose idle clock (the
+// last read or completed send) stood at base would pass ReadTimeout or
+// IdleTimeout. A conn whose clock is later than that by the time it is looked at
+// costs one early look, which computes the time again.
+func (w *Worker) dueIdleFrom(base, now int64) {
+	if rt := w.cfg.ReadTimeout; rt > 0 {
+		w.dueAt(base+int64(rt)+1, now)
+	}
+	if it := w.cfg.IdleTimeout; it > 0 {
+		w.dueAt(base+int64(it)+1, now)
+	}
+}
+
+// dueWrite lowers the next look to when the write clock of a connection with
+// output in flight (its last read or completed send plus WriteTimeout) runs out.
+func (w *Worker) dueWrite(cs *connState) {
+	if wt := w.cfg.WriteTimeout; wt > 0 {
+		w.dueAt(cs.lastActivity+int64(wt)+1, w.cachedNow)
+	}
+}
+
+// dueH2 lowers the next look to the earliest deadline of an HTTP/2 connection
+// (conn.H2State.NextDeadline). A deadline that is owed already (a batch of
+// expired requests that the sweep's budget cut off, a sweep whose lock was held)
+// is looked at one floor from now.
+func (w *Worker) dueH2(h *conn.H2State, now int64) {
+	if h == nil {
+		return
+	}
+	if t := h.NextDeadline(now); t != 0 {
+		if t <= now {
+			t = now + sweepFloor
+		}
+		w.dueAt(t, now)
+	}
 }
 
 // sweepClock is the clock sweepDue is given. (Since celeris#1173 the loop reads
@@ -83,16 +194,17 @@ func (w *Worker) sweepClock(gotCQE, gateHit bool) int64 {
 // review r2 of #1114). Worker thread.
 func (w *Worker) hasLongIdleWait() bool { return w.listenFD < 0 }
 
-// armSweepTick makes sure an IORING_OP_TIMEOUT of sweepCeiling is outstanding
-// before the run loop waits for a SEND's completion with no timeout (mode 3a),
-// and reports whether the wait may go ahead untimed (celeris#884 item 74).
-// Mode 3a ends with the next CQE of any conn, and a SEND under longSendBytes
-// into a socket that has no room is unmarked (markLongSend) and produces none,
-// so a worker whose last submission is such a SEND never ran another
-// iteration, and so no sweep, and WriteTimeout was never looked at. The timer
-// is the kernel's guarantee of a CQE: its completion (handleSweepTick) ends the
-// wait and has the next iteration sweep. It costs one SQE and one CQE per
-// second, in the submit the wait makes anyway, and a bool test for every wait
+// armSweepTick makes sure an IORING_OP_TIMEOUT is outstanding before the run
+// loop waits for a SEND's completion with no timeout (mode 3a), and reports
+// whether the wait may go ahead untimed (celeris#884 item 74). The timer is
+// sweepCeiling long, or less when the next look is sooner (dueWait,
+// celeris#1430). Mode 3a ends with the next CQE of any conn, and a SEND under
+// longSendBytes into a socket that has no room is unmarked (markLongSend) and
+// produces none, so a worker whose last submission is such a SEND never ran
+// another iteration, and so no sweep, and WriteTimeout was never looked at. The
+// timer is the kernel's guarantee of a CQE: its completion (handleSweepTick)
+// ends the wait and has the next iteration sweep. It costs one SQE and one CQE
+// per second, in the submit the wait makes anyway, and a bool test for every wait
 // after that: not the ext_arg a timed wait pays on each one, which is what mode
 // 3a exists to skip. With no SQE to be had it reports false and the loop waits
 // with a timeout instead. Worker thread.
@@ -107,17 +219,37 @@ func (w *Worker) armSweepTick() bool {
 	if sqe == nil {
 		return false
 	}
-	w.sweepTickSpec.Sec = sweepCeiling / int64(time.Second)
-	w.sweepTickSpec.Nsec = sweepCeiling % int64(time.Second)
+	now := mono.Now()
+	d := sweepCeiling
+	if t := w.dueTime(); t != 0 && t-now < d {
+		d = max(t-now, int64(time.Millisecond))
+	}
+	w.sweepTickSpec.Sec = d / int64(time.Second)
+	w.sweepTickSpec.Nsec = d % int64(time.Second)
 	prepTimeout(sqe, unsafe.Pointer(&w.sweepTickSpec), 0, 0)
 	setSQEUserData(sqe, encodeUserData(udSweepTick, 0))
 	w.sweepTickArmed = true
+	w.sweepTickAt = now + d
 	return true
+}
+
+// sweepTickOK reports whether the loop may wait for a SEND with no timeout: the
+// standing timer is outstanding, or has been armed now, and fires no later than
+// the next look. A timer armed for a later time than a look that has been
+// lowered since (an accept, a send started) would hold the wait past it, so that
+// wait is the timed one, capped at the look (celeris#1430). Worker thread.
+func (w *Worker) sweepTickOK() bool {
+	if w.sweepTickArmed {
+		t := w.dueTime()
+		return t == 0 || w.sweepTickAt <= t+int64(time.Millisecond)
+	}
+	return w.armSweepTick()
 }
 
 // handleSweepTick takes the standing sweep timer's CQE: the timer is no longer
 // outstanding (the next mode-3a wait arms another) and, when it ran its
-// second (-ETIME), the loop owes a sweep (sweepDue). Any other result (-EINVAL
+// time (-ETIME), the loop owes a sweep (sweepDue), unless one ran within the
+// floor before it. Any other result (-EINVAL
 // from a kernel that refuses the SQE, -ECANCELED, -ENOMEM) means the timer did
 // not do its job: it is no reason to sweep, and arming another would end every
 // mode-3a wait at once and make a full sweep, past the floor, after every
@@ -127,7 +259,13 @@ func (w *Worker) armSweepTick() bool {
 func (w *Worker) handleSweepTick(res int32) {
 	w.sweepTickArmed = false
 	if res == -int32(unix.ETIME) {
-		w.sweepTickFired = true
+		// Not when a sweep ran within the floor before the time the timer was
+		// aimed at: the timer is armed for the next look (celeris#1430), and
+		// another iteration may have made that sweep first; a second one inside
+		// the floor would be a sweep the floor forbids.
+		if w.sweepTickAt-w.lastSweep >= sweepFloor {
+			w.sweepTickFired = true
+		}
 		return
 	}
 	if !w.sweepTickBroken {
