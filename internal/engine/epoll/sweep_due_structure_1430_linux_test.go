@@ -32,6 +32,8 @@ package epoll
 //   - "pin": the clock is set or moved off the loop with no event for it, or is
 //     the HTTP/2 layer's own: a loop that holds such a connection is not skipped
 //     (sweepDue names what pins it);
+//   - "copy": the clock is read only to fill a field of the snapshot, which carries
+//     the class;
 //   - "own": the clock belongs to a sweep with its own pace (the transplant
 //     drain's sweepNext, applied to the wait by sweepWaitMs), or is the sweep's
 //     own stamp.
@@ -52,12 +54,13 @@ import (
 type clockSite1430 struct {
 	class string
 	hooks []string // class "hook": the functions that start the clock between walks
+	via   string   // class "copy": the field the value is copied into, which carries the class
 	why   string
 }
 
 var sweepClocks1430 = map[string]clockSite1430{
 	"detectDeadline":   {class: "walk", why: "accept + ReadHeaderTimeout of a connection whose protocol is not decided; also the h2 owed stamp (noteH2Owed), which the exempt branch reports as rearm"},
-	"HeaderDeadlineNs": {class: "walk", why: "the header deadline, read through the snapshot (hdrDL)"},
+	"HeaderDeadlineNs": {class: "copy", via: "hdrDL", why: "the header deadline, copied into the snapshot (hdrDL) by snapshotH1Deadlines"},
 	"hdrDL":            {class: "walk", why: "the snapshot of HeaderDeadlineNs"},
 	"lastActivity":     {class: "walk", why: "last read + min(IdleTimeout, ReadTimeout)"},
 	"writeSince":       {class: "hook", hooks: []string{"armEpollOut", "handleWritable"}, why: "a parked response is looked at at every tick until it drains; its first look is owed one tick after the park"},
@@ -65,7 +68,8 @@ var sweepClocks1430 = map[string]clockSite1430{
 	"closeSampled":     {class: "rearm", why: "sampled by the closing drain, the write-rate window and the detached stall: looked at again at the next tick"},
 	"drainDeadline":    {class: "rearm", why: "the grace of a detached connection's reap"},
 	"idleDL":           {class: "rearm", why: "a detached connection's idle deadline as read at this walk (the loop is pinned by it as well)"},
-	"IdleDeadlineNs":   {class: "pin", why: "set by the middleware's goroutine with no event for the loop: a loop that holds a detached connection is not skipped"},
+	"IdleDeadlineNs":   {class: "pin", via: "idleDL", why: "set by the middleware's goroutine with no event for the loop: a loop that holds a detached connection is not skipped"},
+	"nextDue":          {class: "own", why: "the next-due time itself, stored by the walk"},
 	"lastSweep":        {class: "own", why: "the sweep's own stamp: the gate's floor and the stepped-clock rule"},
 	"sweepNext":        {class: "own", why: "the transplant drain's own pace (sweepWaitMs caps the wait at it)"},
 	"sweepIvl":         {class: "own", why: "the transplant drain's pace"},
@@ -105,13 +109,16 @@ var sweepCallees1430 = map[string]string{
 	"int64":            "conversion",
 	"Duration":         "conversion",
 	"csWritePending":   "queue state, no clock",
+	"sweepHorizon":     "the safety cap, made of the configured timeouts",
+	"idleBound":        "min(IdleTimeout, ReadTimeout)",
+	"min":              "builtin",
 }
 
 func parseSweepFiles1430(t *testing.T) (*token.FileSet, map[string]*ast.File) {
 	t.Helper()
 	fset := token.NewFileSet()
 	files := map[string]*ast.File{}
-	for _, name := range []string{"loop.go", "write_rate_885.go", "conn.go", "sweep.go", "../../conn/h1.go"} {
+	for _, name := range []string{"loop.go", "write_rate_885.go", "conn.go", "sweep.go", "sweep_due_1430.go", "../../conn/h1.go"} {
 		f, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
@@ -352,9 +359,13 @@ func TestSweepNextDueKnowsEveryClockTheSweepReads1430(t *testing.T) {
 				}
 			}
 		case "pin":
+		case "copy":
+			if _, ok := sweepClocks1430[site.via]; !ok {
+				t.Errorf("clock %q is copied into %q, which is not in the table", f, site.via)
+			}
 		case "own":
 		default:
-			t.Errorf("clock %q has the class %q, which is none of walk, rearm, hook, pin, own", f, site.class)
+			t.Errorf("clock %q has the class %q, which is none of walk, rearm, hook, pin, copy, own", f, site.class)
 		}
 	}
 	// What pins a loop: HTTP/2 connections (their clocks are the stream layer's,

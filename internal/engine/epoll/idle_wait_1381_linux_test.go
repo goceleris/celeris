@@ -6,13 +6,14 @@ package epoll
 // second (the 4 ms epoll_wait, and the 25 ms sweep timer through the same
 // epoll set), and the process cost followed. The change makes a loop that holds
 // no connection of any kind, and nothing queued, wait 100 ms and tick its sweep
-// timer every 100 ms; a loop with any connection keeps the 25 ms sweep.
+// timer every 100 ms; a loop with any connection keeps the 25 ms timer (and, since
+// celeris#1430, walks its connections when something is due).
 //
 // What these tests guard is the other side of the same change: everything that
 // used to be seen within a few milliseconds by a loop that is idle must still be
 // seen as promptly (a context cancel, a pause, an accept, an adopt, a driver
 // registration, a connection that arrives and goes), and a loop that holds a
-// connection must keep its sweep cadence. They are written against the loop's
+// connection must keep its timer. They are written against the loop's
 // own identifiers only (the sweep hook, consecutiveEmpty), so they compile and
 // run on the code before the change; only the first is expected to fail there.
 //
@@ -290,10 +291,11 @@ func TestFirstRequestAfterIdleIsNotStalled1381(t *testing.T) {
 	}
 }
 
-// liveSweepsPerSecond1381 is the least number of sweeps a second that a loop
-// holding a connection must make: its timer is 25 ms, 40 a second, and the
-// long wait of an idle loop would give 10.
-const liveSweepsPerSecond1381 = 25
+// liveSweepsAtMost1381 is the most walks of its connections that a loop with
+// nothing due makes in the window of these tests (a second): the safety cap of
+// celeris#1430 gives one, and a timeout that is short gives two. The 25 ms timer
+// that the loop keeps would give 40.
+const liveSweepsAtMost1381 = 6
 
 // liveSweeps1381 holds one keep-alive connection open on the engine for window
 // and returns the sweeps made, by the loop that holds it, in that time.
@@ -321,20 +323,28 @@ func liveSweeps1381(t *testing.T, p *idleProbe1381, addr string, window time.Dur
 	return after - before
 }
 
-// A loop that holds a connection sweeps every 25 ms, after a long idle as
-// before it: the change must give the loop its short cadence back at the
-// first connection.
-func TestLoopSweepsEvery25msWhileItHoldsAConnectionAfterAnIdle1381(t *testing.T) {
+// A loop that holds a connection no longer walks it at every 25 ms tick (it did,
+// after a long idle as before it: celeris#1381 kept the 25 ms timer for any
+// connection). The timer still ticks, and the loop still wakes at it (a longer
+// wait is celeris#1430 part W), but the walk of the loop's connections is made
+// when something is due: here nothing is, for seconds, so at most a few in a
+// second, the safety cap. That a deadline is still met on time after the skipped
+// walks is TestIdleTimeoutOfAConnectionAfterAnIdleIsOnTime1381 and the rows of
+// TestDeadlinesAreMetOnALoopThatSkipsItsWalks1430, and that a loop that holds an
+// HTTP/2 or a detached connection keeps the 25 ms walk is
+// TestLoopWithAnHTTP2ConnectionKeepsTheFloor1430 and
+// TestLoopWithADetachedConnectionKeepsTheFloor1430.
+func TestLoopWalksItsConnectionsWhenDueAfterAnIdle1381(t *testing.T) {
 	p := probe1381(t)
 	r := start886(t, 2, 0, false)
 	loops := r.e.loopSnapshot()
 	waitIdle1381(t, p, loops)
 	const window = time.Second
 	n := liveSweeps1381(t, p, r.e.Addr().String(), window)
-	t.Logf("celeris1381 LIVE-SWEEPS: %d sweeps in %v by the loop that holds one keep-alive connection (idle for >100 rounds before it), want at least %d",
-		n, window, liveSweepsPerSecond1381)
-	if n < liveSweepsPerSecond1381 {
-		t.Errorf("the loop that held a connection made %d sweeps in %v, want at least %d: it kept the long wait", n, window, liveSweepsPerSecond1381)
+	t.Logf("celeris1381 LIVE-SWEEPS: %d walks in %v by the loop that holds one keep-alive connection (idle for >100 rounds before it), want at most %d (the 25 ms timer gives 40)",
+		n, window, liveSweepsAtMost1381)
+	if n > liveSweepsAtMost1381 {
+		t.Errorf("the loop that held a connection with nothing due walked it %d times in %v, want at most %d: the walk is made when something is due, not at every tick", n, window, liveSweepsAtMost1381)
 	}
 }
 
@@ -424,7 +434,8 @@ func TestLoopIsIdleAgainAfterTheLastConnectionCloses1381(t *testing.T) {
 }
 
 // A connection handed over by the other engine (an adopt) after a long idle is
-// served at once, and its deadlines run at the short cadence.
+// served at once, and its deadlines are in the next walk's due time (the idle
+// timeout of 1 s walks it a few times in the second, not at every tick).
 func TestAdoptedConnectionAfterAnIdleIsServed1381(t *testing.T) {
 	p := probe1381(t)
 	eng, _, _ := start1194(t, func(c *resource.Config) { c.IdleTimeout = time.Second })
@@ -454,9 +465,9 @@ func TestAdoptedConnectionAfterAnIdleIsServed1381(t *testing.T) {
 	time.Sleep(time.Second) // the measurement window, not a synchronisation
 	var after int64
 	p.stats.Range(func(_, v any) bool { after += v.(*idleStat1381).liveSweeps.Load(); return true })
-	t.Logf("celeris1381 ADOPT-SWEEPS: %d sweeps in 1 s by the loop that holds the adopted connection, want at least %d", after-before, liveSweepsPerSecond1381)
-	if after-before < liveSweepsPerSecond1381 {
-		t.Errorf("the loop that holds the adopted connection made %d sweeps in 1 s, want at least %d", after-before, liveSweepsPerSecond1381)
+	t.Logf("celeris1381 ADOPT-SWEEPS: %d walks in 1 s by the loop that holds the adopted connection, want at most %d", after-before, liveSweepsAtMost1381)
+	if after-before > liveSweepsAtMost1381 {
+		t.Errorf("the loop that holds the adopted connection walked it %d times in 1 s, want at most %d: the walk is made when something is due", after-before, liveSweepsAtMost1381)
 	}
 }
 

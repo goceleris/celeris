@@ -308,8 +308,11 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 		t.Errorf("%d sweeps in %v on %d loops under load, want at most %d: a busy loop sweeps every %v at most (the timerfd period), not every 32 iterations",
 			sweeps, span, nLoops, lim, sweepFloor)
 	}
-	if sweeps < 20*nLoops {
-		t.Errorf("only %d sweeps in %v on %d loops: the floor starved the sweep", sweeps, span, nLoops)
+	// A loop whose connections have nothing due walks them about once a second
+	// (the safety cap of celeris#1430), not at every tick; what the floor must
+	// not do is starve the sweep altogether.
+	if sweeps < nLoops {
+		t.Errorf("only %d sweeps in %v on %d loops: the floor starved the sweep (a loop walks at least once in about a second)", sweeps, span, nLoops)
 	}
 }
 

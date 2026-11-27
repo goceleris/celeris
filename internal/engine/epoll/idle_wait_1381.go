@@ -30,8 +30,10 @@ import (
 //
 // The first event restores the 25 ms timer: consecutiveEmpty goes to 0 with it,
 // the predicate is false at the top of the next iteration, and the timer is
-// re-armed before the loop waits again. With any connection the loop behaves
-// exactly as before: the predicate is false, and so is timerSlow.
+// re-armed before the loop waits again. With any connection the loop waits and
+// ticks exactly as before: the predicate is false, and so is timerSlow. (What
+// the tick does there changed in celeris#1430: the walk of the connections is
+// made when something is due, see sweep_due_1430.go; the wake-up is the same.)
 
 // idleWaitMs is the wait, and the period of the sweep timer, of a loop that
 // holds nothing and has been idle for idleEmptyRounds rounds.

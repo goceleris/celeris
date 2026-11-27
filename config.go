@@ -301,9 +301,11 @@ type Config struct {
 	//
 	// The native engines look at ReadTimeout, IdleTimeout and WriteTimeout in a
 	// sweep of their connections, so ReadTimeout and IdleTimeout are enforced up to
-	// a sweep period after their time. On epoll the sweep runs every 25 ms, from a
-	// kernel timer each worker arms whatever ReadHeaderTimeout and the timeouts
-	// are, so within about 30 ms (a 1 s IdleTimeout closed an idle connection at
+	// a sweep period after their time. On epoll a kernel timer each worker arms
+	// whatever ReadHeaderTimeout and the timeouts are ticks every 25 ms, and the
+	// sweep is made at the first tick at or after a deadline (a worker whose
+	// connections have nothing due does not walk them at every tick), so within
+	// about 30 ms (a 1 s IdleTimeout closed an idle connection at
 	// 1.00 to 1.03 s on docker arm64 with 2 CPUs, with ReadHeaderTimeout off as well
 	// as set). On io_uring the sweep of an idle worker is about 0.8 s apart (0.83 s
 	// measured; about 1 s with ReadHeaderTimeout off, and up to about 1.1 s,
