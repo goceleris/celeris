@@ -13,14 +13,22 @@ import (
 )
 
 // celeris#1430, the guard of the list. The sweep computes when its next look at a
-// deadline is due (Worker.dueAt), and a deadline that the sweep reads but that
-// the computation does not know is one the loop does not wake for: it is met at
-// the next sweep of the period (about a second) instead of when it falls due.
-// This test parses the sweeps and fails when a clock they read is not named in
-// the arguments of a dueAt call of the same group, unless the group lists it
-// here with the reason it needs none; and when a site that arms a deadline (a
-// connection accepted or adopted, a send started, a close deferred, a header
-// timer armed, an HTTP/2 frame taken) does not lower the next look.
+// deadline is due (the due* functions of the worker, which lower Worker.nextDue),
+// and a deadline that the sweep reads but that the computation does not know is
+// one the loop does not wake for: it is met at the next sweep of the period
+// (about a second) instead of when it falls due. This test parses the sweeps and
+// fails when a clock they read is not named in the arguments of a due* call of
+// the same group, unless the group lists it here with the reason it needs none;
+// and when a site that arms a deadline (a connection accepted or adopted, a send
+// started, a close deferred, a header timer armed, an HTTP/2 frame taken) does
+// not lower the next look.
+//
+// Every site listed runs on the worker's thread: nextDue is the worker's own, and
+// a site that runs on a dispatch goroutine (the h2c upgrade of an async
+// connection, switchToH2Local, which runs under detachMu off the worker) must not
+// write it. That site is lowered where the worker finishes the upgrade
+// (drainDetachQueue), and an HTTP/2 deadline armed from a pool goroutine (a write
+// window, WrDL) is left to the sweeps the worker makes anyway.
 
 // clockName1430 says which fields are clocks: the connection's and the worker's
 // own stamps, deadlines and sample times, by name. The durations of the
@@ -36,7 +44,7 @@ type group1430 struct {
 	funcs  []string
 	exempt map[string]string
 	// mustCall are selector names (method or function) that one of the funcs must
-	// call, inside the argument of a dueAt call.
+	// call, inside the argument of a due* call.
 	mustCall []string
 }
 
@@ -83,12 +91,14 @@ var armSites1430 = []struct {
 	{"worker.go", "onAcceptedFD", "a connection accepted: its idle and read clock starts"},
 	{"transplant.go", "attachAdoptedFD", "a connection adopted: its idle and read clock starts"},
 	{"worker.go", "flushSend", "a send started: the write clock starts at the stamp it takes"},
+	{"worker.go", "flushSendLink", "a send linked to a recv started: the write clock runs from the last read"},
 	{"worker.go", "closeConn", "a close deferred behind the SENDs in flight: the drain's bound starts"},
 	{"worker.go", "closeStalled", "a stalled stream closed: the drain's bound is spent, the next look reaps it"},
 	{"worker.go", "closeRefused", "an HTTP/2 conn closed for output that did not go out: the next look reaps it"},
 	{"worker.go", "armHeaderTimerAt", "a header deadline armed: the sweep is the kernel timer's fallback"},
 	{"worker.go", "handleRecv", "an HTTP/2 frame taken: a request, header block or write window deadline may have been armed"},
-	{"worker.go", "switchToH2Local", "the first frames of an h2c upgrade taken"},
+	{"worker.go", "switchToH2", "the first frames of an h2c upgrade taken on the worker's own path"},
+	{"worker.go", "drainDetachQueue", "the worker finishes the h2c upgrade of an async connection, whose first frames the dispatch goroutine took"},
 }
 
 func parseFuncs1430(t *testing.T, file string) map[string]*ast.FuncDecl {
@@ -148,8 +158,22 @@ func clockReads1430(fd *ast.FuncDecl) map[string]bool {
 	return reads
 }
 
+// isDue1430 says whether a call is one of the next-look functions: dueAt and the
+// helpers that lower it (their names start with "due").
+func isDue1430(call *ast.CallExpr) bool {
+	name := ""
+	switch f := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		name = f.Sel.Name
+	case *ast.Ident:
+		name = f.Name
+	}
+	// dueTime, dueWait and dueCap read the next look, they do not lower it.
+	return strings.HasPrefix(name, "due") && name != "dueTime" && name != "dueWait" && name != "dueCap"
+}
+
 // dueArgs1430 returns the names (selectors and identifiers) inside the arguments
-// of the dueAt calls of fd.
+// of the due* calls of fd.
 func dueArgs1430(fd *ast.FuncDecl) map[string]bool {
 	names := map[string]bool{}
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -157,7 +181,7 @@ func dueArgs1430(fd *ast.FuncDecl) map[string]bool {
 		if !ok {
 			return true
 		}
-		if !calls1430(call, "dueAt") {
+		if !isDue1430(call) {
 			return true
 		}
 		for _, a := range call.Args {
@@ -242,7 +266,7 @@ func TestSweepClocksAreInTheNextLookComputation1430(t *testing.T) {
 		}
 		unknown, stale, noCall := missing1430(files[g.file], g)
 		if len(unknown) > 0 {
-			t.Errorf("%s %v read these clocks and the next-look computation (a dueAt call with the clock in its argument) does not "+
+			t.Errorf("%s %v read these clocks and the next-look computation (a due* call with the clock in its argument) does not "+
 				"name them, and the group does not exempt them with a reason: %s. A deadline the sweep reads and the computation does "+
 				"not know is met at the next sweep of the period, not when it falls due",
 				g.file, g.funcs, strings.Join(unknown, ", "))
@@ -251,7 +275,7 @@ func TestSweepClocksAreInTheNextLookComputation1430(t *testing.T) {
 			t.Errorf("%s %v: stale exemptions: %s", g.file, g.funcs, strings.Join(stale, ", "))
 		}
 		if len(noCall) > 0 {
-			t.Errorf("%s %v must lower the next look through %s (a dueAt call whose argument calls it)", g.file, g.funcs, strings.Join(noCall, ", "))
+			t.Errorf("%s %v must lower the next look through %s (a due* call whose argument calls it)", g.file, g.funcs, strings.Join(noCall, ", "))
 		}
 	}
 }
@@ -272,21 +296,46 @@ func TestDeadlineArmSitesLowerTheNextLook1430(t *testing.T) {
 		}
 		found := false
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok && (calls1430(call, "dueAt") || calls1430(call, "dueAfterIdle") || calls1430(call, "dueH2")) {
+			if call, ok := n.(*ast.CallExpr); ok && isDue1430(call) {
 				found = true
 			}
 			return !found
 		})
 		if !found {
-			t.Errorf("%s %s does not lower the next look (dueAt): %s", s.file, s.fn, s.why)
+			t.Errorf("%s %s does not lower the next look (a due* call): %s", s.file, s.fn, s.why)
 		}
 	}
 	// The wait is capped at the next look, and the standing timer too.
 	funcs := parseFuncs1430(t, "worker.go")
+	// Every return of sweptTimeout is capped, so that the early return of the
+	// transplant's cap (a worker with no listener) is capped too.
 	if fd := funcs["sweptTimeout"]; fd == nil {
 		t.Error("worker.go: no function sweptTimeout")
-	} else if !callsAny1430(fd, "dueWait") {
-		t.Error("sweptTimeout does not cap the ring wait at the next look (dueWait)")
+	} else {
+		returns := 0
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			ret, ok := n.(*ast.ReturnStmt)
+			if !ok {
+				return true
+			}
+			returns++
+			capped := false
+			for _, r := range ret.Results {
+				ast.Inspect(r, func(m ast.Node) bool {
+					if call, ok := m.(*ast.CallExpr); ok && calls1430(call, "dueCap") {
+						capped = true
+					}
+					return !capped
+				})
+			}
+			if !capped {
+				t.Errorf("sweptTimeout has a return that does not cap the ring wait at the next look (dueCap): every return must")
+			}
+			return true
+		})
+		if returns == 0 {
+			t.Error("sweptTimeout has no return")
+		}
 	}
 	gate := parseFuncs1430(t, "sweep_gate_884.go")
 	if fd := gate["sweepDue"]; fd == nil {
@@ -298,6 +347,9 @@ func TestDeadlineArmSitesLowerTheNextLook1430(t *testing.T) {
 		t.Error("sweep_gate_884.go: no function armSweepTick")
 	} else if !callsAny1430(fd, "dueWait") {
 		t.Error("armSweepTick does not arm the standing timer at the next look (dueWait)")
+	}
+	if fd := gate["sweepTickOK"]; fd == nil {
+		t.Error("sweep_gate_884.go: no function sweepTickOK (an outstanding standing timer that fires after the next look does not end the untimed wait in time)")
 	}
 }
 

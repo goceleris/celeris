@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
@@ -52,6 +57,8 @@ func trials1430(def int) int {
 	}
 	return def
 }
+
+func bufioReader1430(c net.Conn) *bufio.Reader { return bufio.NewReaderSize(c, 64<<10) }
 
 // closedAfter1430 reads from c until it fails and says how long that took from
 // t0, and whether it failed with the connection closed (not a read timeout).
@@ -323,5 +330,124 @@ func TestExpiringConnectionsAreSweptAtMostAtTheFloor1430(t *testing.T) {
 	t.Logf("celeris1430 EXPIRYSWEEPS workers=%d window_ms=%d sweeps=%d bound=%d", workers, window.Milliseconds(), n, bound)
 	if n > bound {
 		t.Errorf("%d sweeps in %v on %d workers, want at most %d (3 times one per sweepFloor)", n, window, workers, bound)
+	}
+}
+
+// TestPausedWorkerDeadlineIsMetWhenDue1430: a worker with no listener (accepts
+// paused) waits a second on the ring whatever it holds, and its sweeps came a
+// second or two apart (TestIouringPausedWorkerSweepsAboutEverySecond884 bounds
+// that at 4.5 s). A connection it holds with IdleTimeout 300 ms is closed when
+// it falls due all the same: the wait is cut at the next look.
+func TestPausedWorkerDeadlineIsMetWhenDue1430(t *testing.T) {
+	e, addr := startFDLEngine(t, newBusyHandler811(), func(c *resource.Config) {
+		c.DisableDeferAccept = true
+		c.ReadTimeout, c.WriteTimeout, c.ReadHeaderTimeout = -1, -1, -1
+		c.IdleTimeout = 300 * time.Millisecond
+	})
+	const wait = 300 * time.Millisecond
+	for i := 0; i < trials1430(3); i++ {
+		// A connection accepted before the pause, served after it: the worker that
+		// holds it has no listener, so its waits are a second.
+		var c net.Conn
+		var err error
+		// The listener is back some milliseconds after ResumeAccept returns.
+		for end := time.Now().Add(3 * time.Second); ; {
+			if c, err = net.DialTimeout("tcp", addr, 3*time.Second); err == nil || time.Now().After(end) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := e.PauseAccept(); err != nil {
+			t.Fatalf("PauseAccept: %v", err)
+		}
+		time.Sleep(700 * time.Millisecond) // the waits are at their longest
+		cl := &busyClient811{c: c, br: bufioReader1430(c)}
+		cl.send(t, "/small")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(cl.br, nil)
+		if err != nil {
+			t.Fatalf("trial %d: response: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		t0 := time.Now()
+		got, closed := closedAfter1430(c, t0, wait+3*time.Second)
+		_ = c.Close()
+		if err := e.ResumeAccept(); err != nil {
+			t.Fatalf("ResumeAccept: %v", err)
+		}
+		if !closed {
+			t.Fatalf("trial %d: the connection was still open 3s after its %v timeout", i, wait)
+		}
+		late := got - wait
+		t.Logf("celeris1430 LATENESS row=paused/idle trial=%d timeout_ms=%d late_ms=%d", i, wait.Milliseconds(), late.Milliseconds())
+		if late < -early1430 || late > late1430 {
+			t.Errorf("trial %d: closed %v after the end of its activity, %v after its %v due time: want within -%v and +%v "+
+				"(a worker with no listener must not hold a deadline up to its 1 s wait)", i, got, late, wait, early1430, late1430)
+		}
+	}
+}
+
+// TestH2RequestOpenIsResetWhenDue1430: an HTTP/2 stream whose request never
+// completes is answered 408 and reset when ReadTimeout falls due. The deadline is
+// armed on the worker when the HEADERS are taken (ArmRequest) and the sweep that
+// answers it came up to a sweep period late (config.go: "ReadTimeout plus two
+// sweeps" on io_uring). The reset is read from the client's side: the time from
+// the HEADERS to the RST_STREAM of the stream.
+func TestH2RequestOpenIsResetWhenDue1430(t *testing.T) {
+	_, addr := startFDLEngine(t, newBusyHandler811(), func(c *resource.Config) {
+		c.Protocol = engine.H2C
+		c.ReadTimeout = 300 * time.Millisecond
+		c.IdleTimeout, c.WriteTimeout, c.ReadHeaderTimeout = -1, -1, -1
+	})
+	time.Sleep(700 * time.Millisecond) // the waits are at their longest
+	const wait = 300 * time.Millisecond
+	for i := 0; i < trials1430(3); i++ {
+		c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
+			t.Fatal(err)
+		}
+		fr := http2.NewFramer(c, c)
+		if err := fr.WriteSettings(); err != nil {
+			t.Fatal(err)
+		}
+		var hb bytes.Buffer
+		enc := hpack.NewEncoder(&hb)
+		for _, f := range [][2]string{{":method", "POST"}, {":scheme", "http"}, {":path", "/small"}, {":authority", "x"}} {
+			_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+		}
+		// The request is opened and not finished: no END_STREAM, no body.
+		t0 := time.Now()
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndHeaders: true}); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(t0.Add(wait + 3*time.Second))
+		var got time.Duration
+		reset := false
+		for !reset {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if rf, ok := f.(*http2.RSTStreamFrame); ok && rf.StreamID == 1 {
+				got, reset = time.Since(t0), true
+			}
+		}
+		_ = c.Close()
+		if !reset {
+			t.Fatalf("trial %d: the stream was not reset within %v of a %v ReadTimeout", i, 3*time.Second, wait)
+		}
+		late := got - wait
+		t.Logf("celeris1430 LATENESS row=h2_request_open trial=%d timeout_ms=%d late_ms=%d", i, wait.Milliseconds(), late.Milliseconds())
+		if late < -early1430 || late > late1430 {
+			t.Errorf("trial %d: reset %v after the HEADERS, %v after its %v due time: want within -%v and +%v", i, got, late, wait, early1430, late1430)
+		}
 	}
 }
