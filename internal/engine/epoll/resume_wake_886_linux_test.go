@@ -125,6 +125,7 @@ func start886(t *testing.T, loops int, readHeaderTimeout time.Duration, disarmTi
 					if l.timerFD < 0 {
 						t.Fatalf("celeris886 PREMISE: loop %d has no timerfd to disarm", l.id)
 					}
+					l.idleWaitOff.Store(true) // an idle loop would re-arm it (celeris#1381)
 					if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
 						t.Fatalf("celeris886 PREMISE: disarm timerfd: %v", err)
 					}

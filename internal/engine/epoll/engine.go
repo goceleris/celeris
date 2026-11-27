@@ -364,14 +364,16 @@ func (e *Engine) Type() engine.EngineType {
 }
 
 // BeginPauseAccept starts pausing accept and returns without waiting
-// (celeris#662). Each loop sees the flag at the top of its next iteration,
-// a few milliseconds later at most while it listens (adaptiveTimeoutMs caps
-// the wait at 4 ms; measured 0.8 to 5.9 ms from the call to the closed
-// listener, celeris#886 item 24), which is why it does not signal the wake
-// eventfd, as io_uring's does for its 100 ms ring wait. Then, on its own
-// thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
-// serving for the linger (about 1.5 s from that clear), and closes the
-// listener once it has drained the accept queue. A connection whose
+// (celeris#662). Each loop sees the flag at the top of its next iteration. It
+// signals each loop's wake eventfd, as io_uring's does for its ring wait: a
+// loop that holds nothing waits idleWaitMs (100 ms, celeris#1381) and would
+// see the flag that late; a loop that holds a connection waits 4 ms at most
+// (adaptiveTimeoutMs) and the signal only saves it the rest of the wait
+// (measured 0.8 to 5.9 ms from the call to the closed listener without it,
+// celeris#886 item 24). Then, on its own thread, it clears TCP_DEFER_ACCEPT
+// on its listener, keeps accepting and serving for the linger (about 1.5 s
+// from that clear), and closes the listener once it has drained the accept
+// queue. A connection whose
 // handshake completed before the pause but which has sent nothing yet is
 // promoted by the kernel during the linger and served like any other,
 // instead of being reset by the close.
@@ -384,6 +386,13 @@ func (e *Engine) Type() engine.EngineType {
 func (e *Engine) BeginPauseAccept() {
 	e.pause.Begin(e.cfg.Logger, "epoll")
 	e.acceptPaused.Store(true)
+	// After the store, as ResumeAccept signals after its own: a loop woken
+	// here reads the flag set. A leaf lock and one write(2) per loop; a loop
+	// that is running just reads the counter at its next wakeup, and the
+	// handle makes a signal before the loop's eventfd exists a no-op.
+	for _, l := range e.loopSnapshot() {
+		l.wakeFD.Signal()
+	}
 }
 
 // PauseAccept stops accepting new connections. It is BeginPauseAccept

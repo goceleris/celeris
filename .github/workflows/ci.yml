@@ -2707,6 +2707,83 @@ jobs:
             exit 1
           fi
 
+  # celeris#1381: an idle native-engine loop waits 100 ms where it waited 4 ms (epoll)
+  # or 25 ms (io_uring). The tests that guard the change run in the Unit job's race
+  # steps on x86; this job runs them, by name and with skipping forbidden, under
+  # -race on both architectures, and adds what no other job runs: ./test/server's
+  # idle test and the slowloris scenarios of ./test/integration under -race.
+  idle-wait:
+    name: Idle loop wait (celeris#1381, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: Idle-wait tests under -race (skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CPUs: $(nproc), arch: $(uname -m)"
+          epoll=(
+            TestIdleLoopWakeupsAreBounded1381
+            TestIdleShutdownIsPrompt1381
+            TestBeginPauseAcceptReachesALoopThatIsIdle1381
+            TestFirstRequestAfterIdleIsNotStalled1381
+            TestLoopSweepsEvery25msWhileItHoldsAConnectionAfterAnIdle1381
+            TestIdleTimeoutOfAConnectionAfterAnIdleIsOnTime1381
+            TestConnectionResetWhileTheLoopIsIdle1381
+            TestLoopIsIdleAgainAfterTheLastConnectionCloses1381
+            TestAdoptedConnectionAfterAnIdleIsServed1381
+            TestDriverConnectionOnAnIdleLoopReceives1381
+            TestIdleQuiescentIsFalseForAnythingTheLoopHolds1381
+            TestIdleWaitTier1381
+            TestSweepTimerFollowsWhatTheLoopHolds1381
+            TestTransplantDrainTakesTheLoopOffTheLongWait1381
+            TestLoopWithoutAnEventfdNeverTakesTheLongWait1381
+            TestSetSweepPeriodRecordsTheTimerOnlyOnceItIsArmed1381
+            TestSetSweepPeriodLeavesATimerATestDisarmedAlone1381
+          )
+          iouring=(
+            TestIdleWorkerWakeupsAreBounded1381
+            TestWorkerWithAConnectionKeepsTheShortWait1381
+            TestFirstRequestAfterIdleIsNotStalled1381
+            TestIdleShutdownIsPrompt1381
+            TestIdleWaitOfAWorkerThatHoldsNothing1381
+            TestDriverRegistrationReachesAnIdleWorker1381
+            TestAdoptedConnectionReachesAnIdleWorker1381
+          )
+          server=(TestIdleServerFirstRequestAndShutdown1381)
+          integration=(TestSlowlorisSynthetic TestSlowlorisSyntheticConcurrent TestSlowlorisAfterAnIdleEngine1381)
+          alt=$(IFS='|'; echo "${epoll[*]}")
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run "^(${alt})\$" ./internal/engine/epoll/ 2>&1 | tee /tmp/idle-epoll.log || failed=$((failed + 1))
+          alt=$(IFS='|'; echo "${iouring[*]}")
+          go test -race -count=1 -timeout=300s -v -run "^(${alt})\$" ./internal/engine/iouring/ 2>&1 | tee /tmp/idle-iouring.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestIdleServerFirstRequestAndShutdown1381$' ./test/server/ 2>&1 | tee /tmp/idle-server.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestSlowlorisSynthetic|TestSlowlorisSyntheticConcurrent|TestSlowlorisAfterAnIdleEngine1381)$' ./test/integration/ 2>&1 | tee /tmp/idle-integration.log || failed=$((failed + 1))
+          bad=0
+          .github/scripts/named-tally.sh 'celeris#1381 epoll' /tmp/idle-epoll.log "${epoll[@]}" || bad=$((bad + 1))
+          .github/scripts/named-tally.sh 'celeris#1381 io_uring' /tmp/idle-iouring.log "${iouring[@]}" || bad=$((bad + 1))
+          .github/scripts/named-tally.sh 'celeris#1381 test/server' /tmp/idle-server.log "${server[@]}" || bad=$((bad + 1))
+          .github/scripts/named-tally.sh 'celeris#1381 test/integration' /tmp/idle-integration.log "${integration[@]}" || bad=$((bad + 1))
+          # The measured values of the run, for the before and after.
+          grep -h 'celeris1381 ' /tmp/idle-epoll.log /tmp/idle-iouring.log /tmp/idle-server.log || true
+          echo "go test runs failed $failed (want 0), tallies failed $bad (want 0)"
+          if [ "$failed" -ne 0 ] || [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest

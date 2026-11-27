@@ -73,6 +73,7 @@ func (p *sweepProbe885) hook(l *Loop) {
 	}
 	p.mu.Unlock()
 	if first && l.timerFD >= 0 {
+		l.idleWaitOff.Store(true) // an idle loop would re-arm it (celeris#1381)
 		_ = unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil)
 	}
 	for _, cs := range l.liveConns {

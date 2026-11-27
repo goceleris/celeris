@@ -2615,7 +2615,8 @@ func (w *Worker) armHeaderTimerAt(cs *connState, dl int64) {
 // listen socket is closed (draining), uses 1s. When H2 connections exist
 // without eventfd, uses 100us for write queue polling. When detached
 // conns exist with idle deadlines or ReadHeaderTimeout is configured, the
-// cap drops to 25ms so checkTimeouts can fire detached-idle deadlines
+// cap drops to 25ms (not for a worker that holds nothing: idleQuiescent,
+// celeris#1381) so checkTimeouts can fire detached-idle deadlines
 // before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
 // defence when the kernel timer SQE failed to arm under SQ-ring pressure.
 // While an accept pause lingers, the wait is also capped at the time left to
@@ -2677,7 +2678,9 @@ func (w *Worker) baseTimeout() time.Duration {
 	if w.detachedCount > 0 {
 		maxWait = 50 * time.Millisecond
 	}
-	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond {
+	// The cap is for the deadlines of the conns the worker holds: not for one that
+	// holds nothing and has been idle for 100 rounds (celeris#1381, idle_wait_1381.go).
+	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond && (w.emptyIters <= 100 || !w.idleQuiescent()) {
 		maxWait = 25 * time.Millisecond
 	}
 	switch {

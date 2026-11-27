@@ -40,7 +40,8 @@ func TestQueuedZeroTimeoutRoundsDoNotStretchTheIdleWait885(t *testing.T) {
 	if l.timerFD < 0 {
 		t.Fatalf("apparatus: the loop has no sweep timerfd to disarm (every loop has one, celeris#1194)")
 	}
-	// The timerfd can fire between two rounds of the flood: disarm it.
+	// The timerfd can fire between two rounds of the flood: disarm it (and keep an idle loop from re-arming it, celeris#1381).
+	l.idleWaitOff.Store(true)
 	if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
 		t.Fatalf("apparatus: disarm the sweep timerfd: %v", err)
 	}
