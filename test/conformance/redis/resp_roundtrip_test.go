@@ -286,12 +286,6 @@ func TestRESPLargeAndBinaryBulk(t *testing.T) {
 	})
 }
 
-const (
-	bStr   = "R1 DoString/DoInt on a RESP3 double, bool or big number returns an error where RESP2 returns the value"
-	bSlice = "R2 DoSlice turns every non-bulk element (integer, double, bool, nested array) into an empty string"
-	bMap   = "R1 DoSlice on a RESP3 map returns an error where RESP2 returns the flat array"
-)
-
 // rtHelperRow is one reply, read through the typed helpers of Client: what each of DoString,
 // DoInt, DoBool and DoSlice must give ("ERR" when the helper must return an
 // error: the reply is not of its kind).
@@ -308,15 +302,15 @@ func rtHelperRows() []rtHelperRow {
 		{name: "bulk", script: "return 'bulk'", str: "bulk", integer: "ERR", boolean: "ERR", slice: "ERR"},
 		{name: "integer", script: "return 7", str: "7", integer: "7", boolean: "true", slice: "ERR"},
 		{name: "status", script: "return redis.status_reply('FINE')", str: "FINE", integer: "ERR", boolean: "ERR", slice: "ERR"},
-		{name: "double", script: set3 + "return {double=3.5}", str: "3.5", integer: "ERR", boolean: "ERR", slice: "ERR", bug3: bStr},
-		{name: "bool_true", script: set3 + "return true", str: "1", integer: "1", boolean: "true", slice: "ERR", bug3: bStr},
-		{name: "bool_false", script: set3 + "return false", str: "0", integer: "0", boolean: "false", slice: "ERR", bug3: bStr},
-		{name: "big_number", script: set3 + "return {big_number='123456789012345678901234567890'}", str: "123456789012345678901234567890", integer: "ERR", boolean: "ERR", slice: "ERR", bug3: bStr},
+		{name: "double", script: set3 + "return {double=3.5}", str: "3.5", integer: "ERR", boolean: "ERR", slice: "ERR"},
+		{name: "bool_true", script: set3 + "return true", str: "1", integer: "1", boolean: "true", slice: "ERR"},
+		{name: "bool_false", script: set3 + "return false", str: "0", integer: "0", boolean: "false", slice: "ERR"},
+		{name: "big_number", script: set3 + "return {big_number='123456789012345678901234567890'}", str: "123456789012345678901234567890", integer: "ERR", boolean: "ERR", slice: "ERR"},
 		{name: "verbatim", script: set3 + "return {verbatim_string={string='hello', format='txt'}}", str: "hello", integer: "ERR", boolean: "ERR", slice: "ERR"},
 		{name: "set", script: set3 + "return {set={a=true}}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "a"},
 		{name: "array_of_bulk", script: "return {'x','y'}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "x|y"},
-		{name: "array_of_int", script: "return {1,2}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "1|2", bug3: bSlice, bug2: bSlice},
-		{name: "map_flat_on_resp2", script: set3 + "return {map={a=1}}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "a|1", bug3: bMap + "; " + bSlice, bug2: bSlice},
+		{name: "array_of_int", script: "return {1,2}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "1|2"},
+		{name: "map_flat_on_resp2", script: set3 + "return {map={a=1}}", str: "ERR", integer: "ERR", boolean: "ERR", slice: "a|1"},
 	}
 }
 
