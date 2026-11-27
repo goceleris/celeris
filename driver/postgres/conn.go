@@ -554,6 +554,16 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 	}
 }
 
+// abandon marks r as one whose caller's context ended: appendBuffered drops the
+// rows that still arrive instead of buffering them. The ctx branch of
+// waitForQueryRows (event loop) and cancelDrainDirect (direct mode) set it
+// before they read the cancelled statement's reply.
+func (r *pgRequest) abandon() {
+	r.doneMu.Lock()
+	r.abandoned = true
+	r.doneMu.Unlock()
+}
+
 // appendBuffered appends one DataRow to the buffered result under doneMu, with
 // a deferred unlock: a panic in the append on the sync path unwinds through
 // pollSync's failAll, whose fail() takes doneMu again. ok is false when the row
@@ -1220,6 +1230,11 @@ func (c *pgConn) cancelDrainDirect(req *pgRequest, err error) error {
 	// middle of the drain and fail a healthy conn. After this nothing of the
 	// context touches the socket.
 	c.settleCtxWatch()
+	// The caller gets the context's error whatever the reply holds. The rows
+	// that still arrive (the server may not act on the cancel at once, or at
+	// all when the statement already ended) are read to keep the wire aligned
+	// and dropped, not buffered (celeris#1466).
+	req.abandon()
 	// Returns once the cancel exchange finished; a conn whose exchange did not
 	// is failed (discarded), nothing to drain.
 	if !c.cancelRunning() {
@@ -2939,9 +2954,7 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// a worker already blocked in sendRow and keeps a promotion from
 		// publishing a stream. The worker then reads on to ReadyForQuery. The
 		// rows buffered so far are dropped with the request.
-		req.doneMu.Lock()
-		req.abandoned = true
-		req.doneMu.Unlock()
+		req.abandon()
 		req.closeRowCh()
 		confirmed := c.cancelRunning()
 		// A conn that cancelRunning failed completes req at once (failAll). The
