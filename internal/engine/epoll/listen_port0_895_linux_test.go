@@ -20,6 +20,7 @@ import (
 
 	celerisengine "github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
+	"github.com/goceleris/celeris/internal/tcpack"
 )
 
 // celeris#895. Every loop used to bind Config.Addr itself, so with port 0 and
@@ -55,6 +56,10 @@ func (s sockets895) owned895(port int) string {
 
 func census895(t *testing.T) sockets895 {
 	t.Helper()
+	// The host probe (internal/tcpack) listens on a loopback port of its own for
+	// a moment, from just before Addr() is published (celeris#1404): wait for it
+	// to close that socket, so that it is not counted as one of the engine's.
+	tcpack.Wait()
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatalf("read /proc/self/fd: %v", err)
