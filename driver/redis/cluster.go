@@ -108,6 +108,8 @@ type ClusterClient struct {
 
 	closeCh chan struct{}
 	closed  atomic.Bool
+	// beforeLostPrimaryCheck is a test seam: nil outside tests (see doWithRetryCmd).
+	beforeLostPrimaryCheck func()
 }
 
 // NewClusterClient creates a Redis Cluster client. It connects to the seed
@@ -851,6 +853,9 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 					node = primary
 					continue
 				}
+			}
+			if c.beforeLostPrimaryCheck != nil {
+				c.beforeLostPrimaryCheck()
 			}
 			// Non-Redis error on a primary means the master just died
 			// (crash, network partition, container stop). Without an
