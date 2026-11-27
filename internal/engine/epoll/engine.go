@@ -114,11 +114,6 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	// The idle clock of an h2 conn needs to know whether this host reports the
-	// bytes a peer has acknowledged: ask now, in the background, so that the
-	// answer is there long before a sweep needs it (internal/tcpack).
-	tcpack.Start()
-
 	e := &Engine{
 		cfg:     cfg,
 		handler: handler,
@@ -232,6 +227,14 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 	// Every loop has pinned (or failed to) before it reported ready.
 	platform.LogPinOutcome(e.cfg.Logger, "epoll", nicIRQReport(e.cfg.Logger, plan, e.cfg.Addr), takePinFailures(loops))
+
+	// Every loop has bound its listener: only now ask the host whether it
+	// reports the bytes a peer has acknowledged (internal/tcpack). The probe
+	// binds an ephemeral loopback port, which must not happen while a loop is
+	// about to bind the caller's port (celeris#1404). Before the address is
+	// published, so that a caller that sees Addr() knows the probe has begun;
+	// the h2 idle clock needs the answer only long after this.
+	tcpack.Start()
 
 	if len(e.loops) > 0 {
 		// celeris#639: publish an address a loop recorded before it signalled
