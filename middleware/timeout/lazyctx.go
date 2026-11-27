@@ -46,6 +46,11 @@ type lazyDeadlineCtx struct {
 
 // newLazyDeadlineCtx constructs a lazy-deadline context wrapping parent.
 func newLazyDeadlineCtx(parent context.Context, deadline time.Time) *lazyDeadlineCtx {
+	// Like context.WithDeadline, keep the earlier of the parent's deadline
+	// and this one (celeris#1393).
+	if pd, ok := parent.Deadline(); ok && pd.Before(deadline) {
+		deadline = pd
+	}
 	return &lazyDeadlineCtx{parent: parent, deadline: deadline}
 }
 
