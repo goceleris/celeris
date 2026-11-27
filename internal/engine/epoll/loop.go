@@ -352,12 +352,14 @@ type Loop struct {
 	// with, so a turn costs no allocation (celeris#930).
 	driverReadQ, driverReadQNext []*driverConn
 	// ctlMu guards epollFD against the driver goroutines, which issue
-	// epoll_ctl on it from outside the loop thread. shutdown takes it as a
-	// writer before it closes the descriptor (closeEpollFD), so a driver's
-	// epoll_ctl either completes first or is refused — it can never land on
-	// a recycled descriptor number. Same rule as the wakeup eventfd, for the
-	// other descriptor a driver can reach (celeris#655). A LEAF: held only
-	// across the epoll_ctl itself, and taken while holding driverMu or dc.mu.
+	// epoll_ctl on it from outside the loop thread. run's init writes the
+	// field under it, and shutdown, or run's early returns when the init
+	// fails, take it as a writer before they close the descriptor
+	// (closeEpollFD), so a driver's epoll_ctl either completes first or is
+	// refused — it can never land on a recycled descriptor number. Same rule
+	// as the wakeup eventfd, for the other descriptor a driver can reach
+	// (celeris#655). A LEAF: held only across the epoll_ctl itself, and taken
+	// while holding driverMu or dc.mu.
 	ctlMu     sync.RWMutex
 	ctlClosed bool
 
@@ -493,11 +495,14 @@ func (l *Loop) run(ctx context.Context) {
 		l.ready <- fmt.Errorf("loop %d: epoll_create1: %w", l.id, err)
 		return
 	}
+	l.ctlMu.Lock()
 	l.epollFD = epollFD
+	l.ctlMu.Unlock()
 
 	listenFD, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 	if err != nil {
-		_ = unix.Close(epollFD)
+		// Not a bare Close: l.epollFD must not name a closed number (celeris#1377).
+		l.closeEpollFD()
 		l.ready <- fmt.Errorf("loop %d: listen socket: %w", l.id, err)
 		return
 	}
@@ -509,7 +514,8 @@ func (l *Loop) run(ctx context.Context) {
 		Fd:     int32(listenFD),
 	}); err != nil {
 		_ = unix.Close(listenFD)
-		_ = unix.Close(epollFD)
+		l.listenFD = -1
+		l.closeEpollFD()
 		l.ready <- fmt.Errorf("loop %d: epoll_ctl listen: %w", l.id, err)
 		return
 	}
