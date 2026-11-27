@@ -42,13 +42,22 @@ package epoll
 // reads a "walk" or "rearm" clock must report to due.
 
 import (
+	"bytes"
+	"context"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 type clockSite1430 struct {
@@ -468,5 +477,150 @@ func TestSweepCalleesAreAllReviewed1430(t *testing.T) {
 	sort.Strings(unknown)
 	if len(unknown) > 0 {
 		t.Errorf("the sweep calls %v, which sweepCallees1430 does not list: read what each does with a clock, scan it (sweepFuncs1430) or give the reason it needs none", unknown)
+	}
+}
+
+// h1SnapshotLoads1430 is the statement that reads the H1 deadlines of a
+// connection, `if h1 := cs.h1State; h1 != nil { ... }`, printed without its
+// comments, from fn.
+func h1SnapshotLoads1430(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl) string {
+	t.Helper()
+	var found []string
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		is, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		as, ok := is.Init.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 || typeName1430(as.Lhs[0]) != "h1" || typeName1430(as.Rhs[0]) != "cs.h1State" {
+			return true
+		}
+		var b bytes.Buffer
+		if err := printer.Fprint(&b, fset, is); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		found = append(found, b.String())
+		return false
+	})
+	if len(found) != 1 {
+		t.Fatalf("%s has %d statements of the form `if h1 := cs.h1State; ...` (want 1)", fn.Name.Name, len(found))
+	}
+	return found[0]
+}
+
+// TestInlineH1SnapshotIsSnapshotH1Deadlines1430: checkTimeouts reads the H1
+// deadlines of a connection that has no detach lock inline, because the call to
+// snapshotH1Deadlines is not inlined and was paid once per connection per walk.
+// The inline block is a copy of the loads that function makes when it has no
+// lock to take, and a copy can drift: a field loaded by one and not the other.
+// The two statements are the same statement, and the inline one is in the
+// branch of a connection with no detach lock.
+func TestInlineH1SnapshotIsSnapshotH1Deadlines1430(t *testing.T) {
+	fset, files := parseSweepFiles1430(t)
+	check := findFunc1430(files, "checkTimeouts")
+	snap := findFunc1430(files, "snapshotH1Deadlines")
+	if check == nil || snap == nil {
+		t.Fatal("no checkTimeouts or snapshotH1Deadlines")
+	}
+	inline, locked := h1SnapshotLoads1430(t, fset, check), h1SnapshotLoads1430(t, fset, snap)
+	if inline != locked {
+		t.Errorf("the loads of the H1 deadlines in checkTimeouts differ from snapshotH1Deadlines':\ninline:\n%s\nsnapshotH1Deadlines:\n%s", inline, locked)
+	}
+	// The statement is in the body of `if cs.detachMu == nil`.
+	var guarded bool
+	ast.Inspect(check.Body, func(n ast.Node) bool {
+		is, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		if be, ok := is.Cond.(*ast.BinaryExpr); ok && be.Op == token.EQL && typeName1430(be.X) == "cs.detachMu" && typeName1430(be.Y) == "nil" {
+			var b bytes.Buffer
+			_ = printer.Fprint(&b, fset, is.Body)
+			guarded = strings.Contains(b.String(), "cs.h1State")
+		}
+		return true
+	})
+	if !guarded {
+		t.Error("the inline loads of the H1 deadlines are not in the branch of `if cs.detachMu == nil`")
+	}
+}
+
+// TestInlineH1SnapshotWalksLikeTheLockedOne1430 is the same equivalence from
+// the outside: a walk over a connection with no detach lock (the inline loads)
+// and over the same connection with a detach lock that is free (the loads of
+// snapshotH1Deadlines) leave the loop and the connection in the same state, for
+// each state a connection's H1 deadlines can be in. A lock that is held is not a
+// row: the walk reads nothing then, and TestNextDueIsTheEarliestOfWhatTheWalkSees1430
+// has the row.
+func TestInlineH1SnapshotWalksLikeTheLockedOne1430(t *testing.T) {
+	type state struct {
+		name  string
+		build func(cs *connState, now int64)
+	}
+	pending := func(cs *connState) { cs.writeBuf = make([]byte, 16) }
+	detached := func(cs *connState, idle int64) {
+		cs.h1State.Detached.Store(true)
+		cs.h1State.IdleDeadlineNs.Store(idle)
+	}
+	hour := int64(time.Hour)
+	for _, st := range []state{
+		{"no HTTP/1 state", func(cs *connState, _ int64) { cs.h1State = nil }},
+		{"no deadline armed", func(*connState, int64) {}},
+		{"header deadline armed", func(cs *connState, now int64) { cs.h1State.HeaderDeadlineNs.Store(now + int64(300*time.Millisecond)) }},
+		{"header deadline armed, bytes queued (not read: not detached)", func(cs *connState, now int64) {
+			cs.h1State.HeaderDeadlineNs.Store(now + int64(300*time.Millisecond))
+			pending(cs)
+		}},
+		{"detached, no idle deadline", func(cs *connState, _ int64) { detached(cs, 0) }},
+		{"detached, idle deadline ahead, nothing queued", func(cs *connState, now int64) { detached(cs, now+hour) }},
+		{"detached, idle deadline ahead, bytes queued: a stall begins", func(cs *connState, now int64) {
+			detached(cs, now+hour)
+			pending(cs)
+		}},
+		{"detached, idle deadline ahead, nothing queued after a stall: it ends", func(cs *connState, now int64) {
+			detached(cs, now+hour)
+			cs.closeSince, cs.closeSampled = now-int64(time.Second), now-int64(time.Second)
+		}},
+		{"detached, idle deadline passed, bytes queued: the drain grace", func(cs *connState, now int64) {
+			detached(cs, now-int64(time.Second))
+			pending(cs)
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			type outcome struct {
+				nextDue, drain, closeSince int64
+				live                       int
+				closeAcked                 bool
+			}
+			t.Cleanup(mono.SetManual(mono.NewManual()))
+			walk := func(async bool) outcome {
+				cs := acquireConnState(context.Background(), 3, 64, async)
+				cs.protocol = engine.HTTP1
+				cs.detected = true
+				cs.h1State = conn.NewH1State()
+				// Read just now, on a clock that stands still: both walks see the
+				// same instant, so the outcomes can be compared exactly.
+				now := mono.Now()
+				cs.lastActivity = now
+				l := dueLoop1430(resource.Config{IdleTimeout: time.Hour, WriteTimeout: time.Hour}, cs)
+				st.build(cs, now)
+				l.checkTimeouts()
+				o := outcome{nextDue: l.nextDue - l.lastSweep, live: len(l.liveConns), closeAcked: cs.closeAckedKnown}
+				if cs.drainDeadline != 0 {
+					o.drain = cs.drainDeadline - l.lastSweep
+				}
+				if cs.closeSince != 0 {
+					o.closeSince = 1 // a clock, whatever its time
+				}
+				if o.live != 1 {
+					t.Fatalf("the walk closed the connection (async=%v): the row is built to close none", async)
+				}
+				return o
+			}
+			inline, locked := walk(false), walk(true)
+			if inline != locked {
+				t.Errorf("a connection with no detach lock (inline loads) ended the walk as %+v, one with a free lock (snapshotH1Deadlines) as %+v", inline, locked)
+			}
+		})
 	}
 }
