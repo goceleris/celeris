@@ -1,10 +1,12 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -28,21 +30,10 @@ func TestDirectDrainDropsRowsAfterTheContextEnded(t *testing.T) {
 	sent := make(chan struct{}, 1)       // the first `before` rows are on the wire
 	cancelSeen := make(chan struct{}, 1) // the CancelRequest reached the backend
 
-	oneRow := func() []byte {
-		payload := buildDataRow([][]byte{[]byte("x")})
-		msg := make([]byte, 5, 5+len(payload))
-		msg[0] = protocol.BackendDataRow
-		binary.BigEndian.PutUint32(msg[1:5], uint32(4+len(payload)))
-		return append(msg, payload...)
-	}()
-	repeat := func(n int) []byte {
-		buf := make([]byte, 0, n*len(oneRow))
-		for i := 0; i < n; i++ {
-			buf = append(buf, oneRow...)
-		}
-		return buf
-	}
-	beforeRows, afterRows := repeat(before), repeat(after)
+	payload := buildDataRow([][]byte{[]byte("x")})
+	oneRow := binary.BigEndian.AppendUint32([]byte{protocol.BackendDataRow}, uint32(4+len(payload)))
+	oneRow = append(oneRow, payload...)
+	beforeRows, afterRows := bytes.Repeat(oneRow, before), bytes.Repeat(oneRow, after)
 	cols := []colSpec{{name: "v", typeOID: protocol.OIDText, typeSize: -1, format: protocol.FormatText}}
 
 	addr := startFakePG(t, func(c net.Conn) {
@@ -138,13 +129,8 @@ func TestDirectDrainDropsRowsAfterTheContextEnded(t *testing.T) {
 		t.Fatalf("the statement after the cancelled one: %v", err)
 	}
 	dest := make([]driver.Value, 1)
-	if err := rows.Next(dest); err != nil {
-		t.Fatalf("the statement after the cancelled one: %v", err)
-	}
-	if s, _ := dest[0].(string); s != "next" {
-		if b, _ := dest[0].([]byte); string(b) != "next" {
-			t.Fatalf("the statement after the cancelled one read %v, want its own row", dest[0])
-		}
+	if err := rows.Next(dest); err != nil || fmt.Sprint(dest[0]) != "next" {
+		t.Fatalf("the statement after the cancelled one: row %v, err %v, want its own row", dest[0], err)
 	}
 	_ = rows.Close()
 }
