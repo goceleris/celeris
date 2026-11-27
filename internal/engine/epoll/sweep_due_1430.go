@@ -30,8 +30,8 @@ import (
 //     used.
 //   - the next tick, for what the walk cannot date: a sampled clock (the
 //     closing drain, the write-rate window of a parked response), a connection
-//     the walk could not read (its lock is held), one it acted on, an HTTP/2
-//     connection that is exempt, a hijack in flight. The walk looks at these at
+//     the walk could not read (its lock is held), an HTTP/2 connection that is
+//     exempt, a detached one, a hijack in flight. The walk looks at these at
 //     every tick, as before.
 //   - sweepHorizon, the safety cap: at most a second after this walk, less when
 //     a timeout is short (see below).
@@ -44,16 +44,23 @@ import (
 //
 // Why a clock that starts between two walks needs no hook of its own, except the
 // two below: a deadline that a connection gets from an event at time t is at
-// least t plus a timeout of the configuration (the accept budget, the header
+// least t plus a timeout of the configuration T (the accept budget, the header
 // deadline armed by the data that arrived, the idle and read deadline from the
-// read), and the walk before t was at most sweepHorizon ago, which is half the
-// shortest of those timeouts (or a second). The next walk therefore comes before
-// the deadline, finds it, and dates it exactly. The clocks that are not of that
-// shape are the two the hooks start (a parked response's write clock, a closing
-// drain's clock: lowerNextDue at armEpollOut, handleWritable and markClosing), and
-// the ones set off the loop, which pin the loop. The structural test of this
-// change (sweep_due_structure_1430_linux_test.go) lists every clock the sweep
-// reads and how each is accounted for, and fails for one that is not.
+// read), and the walk before t was at time W <= t. The next walk is due at
+// W + sweepHorizon and is made at the first tick at or after that; it finds the
+// deadline and dates it exactly, and the deadline is then met at the first tick
+// at or after it, which is the tick a walk at every tick met it at. That holds
+// as long as no tick at or after the deadline is skipped, which needs
+// W + sweepHorizon to come before the deadline with room for the jitter of the
+// ticks: sweepHorizon is half the shortest of the timeouts T can be (a tick or
+// more under it for every timeout of 50 ms or more), and where the shortest is
+// under 50 ms it is nothing, the walk is made at every tick as before. The
+// clocks that are not of this shape are the two the hooks start (a parked
+// response's write clock, a closing drain's clock: lowerNextDue at armEpollOut,
+// handleWritable and markClosing), and the ones set off the loop, which pin the
+// loop. The structural test of this change (sweep_due_structure_1430_linux_test.go)
+// lists every clock the sweep reads and how each is accounted for, and fails for
+// one that is not.
 
 // sweepHorizonMax is the longest the loop goes without a walk of its live
 // connections: the safety cap. A deadline the next-due computation does not know
@@ -81,19 +88,21 @@ func (l *Loop) lowerNextDue(t int64) {
 // sweepHorizon is how long after a walk the next one is due when no connection
 // has an earlier deadline: sweepHorizonMax, or half the shortest timeout that a
 // new deadline can be made of (ReadHeaderTimeout, ReadTimeout, IdleTimeout) when
-// that is shorter, and never less than sweepFloor, the rate the walk had.
+// that is shorter. When that timeout is under two ticks (2 * sweepFloor) it is
+// nothing: the next tick walks, as a loop did before celeris#1430, so that a
+// short timeout is never met later than it was (a deadline 20 ms after a walk
+// would otherwise be met at the second tick after it where the first was due).
 func (l *Loop) sweepHorizon() int64 {
-	h := int64(sweepHorizonMax)
 	fresh := time.Duration(math.MaxInt64)
 	for _, d := range [...]time.Duration{l.cfg.ReadHeaderTimeout, l.cfg.ReadTimeout, l.cfg.IdleTimeout} {
 		if d > 0 && d < fresh {
 			fresh = d
 		}
 	}
-	if half := int64(fresh / 2); half < h {
-		h = max(half, int64(sweepFloor))
+	if fresh < 2*sweepFloor {
+		return 0
 	}
-	return h
+	return min(int64(sweepHorizonMax), int64(fresh/2))
 }
 
 // idleBound is min(IdleTimeout, ReadTimeout), the time a connection may go
