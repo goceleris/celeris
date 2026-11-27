@@ -364,7 +364,9 @@ func TestPausedWorkerDeadlineIsMetWhenDue1430(t *testing.T) {
 		if err := e.PauseAccept(); err != nil {
 			t.Fatalf("PauseAccept: %v", err)
 		}
-		time.Sleep(700 * time.Millisecond) // the waits are at their longest
+		// The worker has no listener, so its waits are a second whatever it has
+		// done (baseTimeout); the connection is served before its own timeout.
+		time.Sleep(100 * time.Millisecond)
 		cl := &busyClient811{c: c, br: bufioReader1430(c)}
 		cl.send(t, "/small")
 		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))

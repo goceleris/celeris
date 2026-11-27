@@ -43,8 +43,8 @@ type group1430 struct {
 	file   string
 	funcs  []string
 	exempt map[string]string
-	// mustCall are selector names (method or function) that one of the funcs must
-	// call, inside the argument of a due* call.
+	// mustCall are the next-look functions (due*) that one of the funcs must
+	// call.
 	mustCall []string
 }
 
@@ -56,7 +56,7 @@ var groups1430 = []group1430{
 	{
 		file:     "worker.go",
 		funcs:    []string{"sweepH2Deadlines"},
-		mustCall: []string{"NextDeadline"},
+		mustCall: []string{"dueH2"},
 	},
 	{
 		// The stall look of a detached connection: the look is taken when
@@ -168,8 +168,8 @@ func isDue1430(call *ast.CallExpr) bool {
 	case *ast.Ident:
 		name = f.Name
 	}
-	// dueTime, dueWait and dueCap read the next look, they do not lower it.
-	return strings.HasPrefix(name, "due") && name != "dueTime" && name != "dueWait" && name != "dueCap"
+	// dueTime, dueNow, dueWait and dueCap read the next look, they do not lower it.
+	return strings.HasPrefix(name, "due") && name != "dueTime" && name != "dueNow" && name != "dueWait" && name != "dueCap"
 }
 
 // dueArgs1430 returns the names (selectors and identifiers) inside the arguments
@@ -245,7 +245,7 @@ func missing1430(funcs map[string]*ast.FuncDecl, g group1430) (unknown, stale, n
 	for _, m := range g.mustCall {
 		found := false
 		for _, name := range g.funcs {
-			if fd := funcs[name]; fd != nil && dueArgs1430(fd)[m] {
+			if fd := funcs[name]; fd != nil && callsAny1430(fd, m) {
 				found = true
 			}
 		}
@@ -275,7 +275,7 @@ func TestSweepClocksAreInTheNextLookComputation1430(t *testing.T) {
 			t.Errorf("%s %v: stale exemptions: %s", g.file, g.funcs, strings.Join(stale, ", "))
 		}
 		if len(noCall) > 0 {
-			t.Errorf("%s %v must lower the next look through %s (a due* call whose argument calls it)", g.file, g.funcs, strings.Join(noCall, ", "))
+			t.Errorf("%s %v must lower the next look through %s", g.file, g.funcs, strings.Join(noCall, ", "))
 		}
 	}
 }
@@ -340,13 +340,18 @@ func TestDeadlineArmSitesLowerTheNextLook1430(t *testing.T) {
 	gate := parseFuncs1430(t, "sweep_gate_884.go")
 	if fd := gate["sweepDue"]; fd == nil {
 		t.Error("sweep_gate_884.go: no function sweepDue")
-	} else if !mentions1430(fd, "nextDue") {
-		t.Error("sweepDue does not ask whether the next look is due (nextDue)")
+	} else if !mentions1430(fd, "dueNow") {
+		t.Error("sweepDue does not ask whether the next look is due (dueNow)")
 	}
 	if fd := gate["armSweepTick"]; fd == nil {
 		t.Error("sweep_gate_884.go: no function armSweepTick")
-	} else if !callsAny1430(fd, "dueWait") {
-		t.Error("armSweepTick does not arm the standing timer at the next look (dueWait)")
+	} else if !callsAny1430(fd, "dueTime") {
+		t.Error("armSweepTick does not arm the standing timer at the next look (dueTime)")
+	}
+	if fd := gate["dueH2"]; fd == nil {
+		t.Error("sweep_gate_884.go: no function dueH2")
+	} else if !callsAny1430(fd, "NextDeadline") {
+		t.Error("dueH2 does not take the HTTP/2 state's next deadline (NextDeadline)")
 	}
 	if fd := gate["sweepTickOK"]; fd == nil {
 		t.Error("sweep_gate_884.go: no function sweepTickOK (an outstanding standing timer that fires after the next look does not end the untimed wait in time)")
