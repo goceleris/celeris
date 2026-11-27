@@ -43,8 +43,10 @@ const (
 // whatever the clock says; so is one after the clock stepped back (d < 0), or
 // the sweep would wait for the clock to catch up. A sweep is also made when the
 // last one found a deadline falling due now (dueNow, celeris#1430): that is
-// added to the sweeps above, none of which is removed. Worker thread; the
-// caller reads the clock only when it has no batch clock to use.
+// added to the sweeps above, none of which is switched off. It counts as a sweep
+// for the floor and the ceiling like any other, so a gate hit within the floor
+// after it does not sweep. Worker thread; the caller reads the clock only when it
+// has no batch clock to use.
 func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 	d := now - w.lastSweep
 	return d >= sweepCeiling || d < 0 || w.sweepTickFired || (gateHit && d >= sweepFloor) || w.dueNow(now)
@@ -53,10 +55,12 @@ func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 // The next look (celeris#1430). Each timeout sweep works out the earliest time at
 // which a connection's deadline could fall due (nextDue), and the loop sweeps
 // then, as well as at the sweeps it made before: the gate, the ceiling, the
-// standing timer. None of those is removed, so a deadline the computation does
-// not know (a connection inside an async handler, one exempt from a timeout, an
-// HTTP/2 deadline lowered from a pool goroutine, a WebSocket deadline moved by
-// the middleware) is met at the sweeps' own period, as it was, and never later.
+// standing timer. None of those is switched off, so a deadline the computation
+// does not know (a connection inside an async handler, one exempt from a timeout,
+// an HTTP/2 deadline lowered from a pool goroutine, a WebSocket deadline moved by
+// the middleware) is met by them, within the old period of its due time: a
+// sweep added for a look counts as a sweep for the floor and the ceiling, so a
+// gate hit within the floor after it is skipped and the ceiling counts from it.
 // Three rules bound what the computation costs:
 //
 //   - nextDue is never sooner than sweepFloor after the last sweep (dueTime), so

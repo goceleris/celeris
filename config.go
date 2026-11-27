@@ -314,9 +314,10 @@ type Config struct {
 	// bound the close within 200 ms of the due time on a loaded runner (50 ms
 	// before it at the earliest), for an idle keep-alive connection, one whose body
 	// stalls, and one held by a paused worker. A deadline the sweep cannot see is
-	// met at the sweeps' own period, as it was: a connection inside an async
-	// handler, an HTTP/2 deadline set from a pool goroutine, and a WebSocket idle
-	// deadline moved by the middleware. An HTTP/2 stream whose request never
+	// met by the sweeps made before, within their old period of its due time: a
+	// connection inside an async handler, an HTTP/2 deadline set from a pool
+	// goroutine, and a WebSocket idle deadline moved by the middleware. An HTTP/2
+	// stream whose request never
 	// arrives is reset when ReadTimeout falls due, within the same bound; the
 	// connection is closed later, and that close is not covered by this bound.
 	// WriteTimeout is judged in windows that end at a sweep too: see
@@ -423,12 +424,16 @@ type Config struct {
 	// of HTTP/1 and hold with the epoll sweep at its 25 ms period, which every
 	// worker has whatever ReadHeaderTimeout and the other timeouts are; over
 	// HTTP/2 the connection is closed one sweep after its stream is reset.
-	// On io_uring the sweeps are paced as ReadTimeout says: there a parked response is
-	// closed at the first sweep after WriteTimeout has passed since its last
-	// activity, up to a sweep period late, and for an HTTP/2 response that is
-	// about WriteTimeout plus three sweeps on an idle worker (a client that took
-	// 64 KiB of an 8 MiB response, with a 2 s WriteTimeout, was closed at 3.13 to
-	// 3.96 s in CI).
+	// On io_uring the sweeps are paced as ReadTimeout says: a parked HTTP/1
+	// response is closed at the first sweep after WriteTimeout has passed since its
+	// last activity, and a send that starts makes the next look at that time, so
+	// the close comes when WriteTimeout falls due, not up to a sweep period after
+	// it. For an HTTP/2 response the client does not take, the window is set by the
+	// goroutine that writes: only an inline handler's, on the loop, is looked at
+	// when it falls due; a pooled handler's (the default) is set on a pool
+	// goroutine and is met at the old period, about WriteTimeout plus three sweeps
+	// on an idle worker (a client that took 64 KiB of an 8 MiB response, with a 2 s
+	// WriteTimeout, was closed at 3.13 to 3.96 s in CI).
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
