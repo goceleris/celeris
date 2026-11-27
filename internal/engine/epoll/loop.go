@@ -4818,11 +4818,28 @@ func (l *Loop) checkTimeouts() {
 		// snapshotH1Deadlines. A conn whose lock is held by a bounded holder
 		// is skipped for this sweep and met again on a later one (not
 		// necessarily the next: the skip is probabilistic).
-		snap, ok := snapshotH1Deadlines(cs)
-		if !ok {
-			// Nothing was read: the next tick looks again.
-			due = min(due, rearm)
-			continue
+		var snap h1DeadlineSnapshot
+		if cs.detachMu == nil {
+			// A conn with no detach lock: the loop is the only writer of its
+			// h1State, and these are, in this order, the loads
+			// snapshotH1Deadlines makes when it has no lock to take. Inlined
+			// because the call is not (cost 262 against a budget of 80) and is
+			// paid once per conn per walk.
+			if h1 := cs.h1State; h1 != nil {
+				if snap.detached = h1.Detached.Load(); snap.detached {
+					snap.idleDL = h1.IdleDeadlineNs.Load()
+					snap.writePending = csWritePending(cs)
+				} else {
+					snap.hdrDL = h1.HeaderDeadlineNs.Load()
+				}
+			}
+		} else {
+			var ok bool
+			if snap, ok = snapshotH1Deadlines(cs); !ok {
+				// Nothing was read: the next tick looks again.
+				due = min(due, rearm)
+				continue
+			}
 		}
 		if snap.detached {
 			// The middleware owns its deadlines and moves them off the loop
