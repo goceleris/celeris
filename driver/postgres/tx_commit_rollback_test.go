@@ -112,7 +112,7 @@ func txArms() []txArm {
 		poolArm("pool-direct"),
 		poolArm("pool-loop", WithEngine(looptest.Unstarted())),
 		{"database-sql", func(t *testing.T, addr string) (func(string) error, func() error, func() error) {
-			db, err := sql.Open(DriverName, dsn(addr))
+			db, err := sql.Open(DriverName, armDSN(dsn(addr)))
 			if err != nil {
 				t.Fatal(err)
 			}

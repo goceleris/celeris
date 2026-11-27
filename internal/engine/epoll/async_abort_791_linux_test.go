@@ -214,7 +214,7 @@ func abortBlocked791() []string {
 func runAbort791(t *testing.T, mode string) {
 	// Port 0: the engine picks the port and holds it until Listen returns
 	// (celeris#895). A port picked here with net.Listen and released is free for
-	// the process's own tcpack probe (New starts it), whose net.Listen("127.0.0.1:0")
+	// the process's own tcpack probe (the engine starts it), whose net.Listen("127.0.0.1:0")
 	// can be handed that very port: the loops then fail to bind it, and this test's
 	// first dial lands on the probe's listener, which resets what it never accepted
 	// when the probe closes it, a second later.

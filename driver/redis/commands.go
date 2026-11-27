@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -112,8 +113,91 @@ func asString(v protocol.Value) (string, error) {
 	case protocol.TyInt:
 		return strconv.FormatInt(v.Int, 10), nil
 	default:
+		if s, ok := scalarText(v); ok {
+			return s, nil
+		}
 		return "", fmt.Errorf("celeris-redis: expected string reply, got %s", v.Type)
 	}
+}
+
+// scalarText is the text RESP2 sends for the RESP3-only scalars: a double as
+// the bulk string the server formats, a boolean as the integer 1 or 0 and a
+// big number as its digits. DoString, DoInt, DoBool and DoSlice read them as
+// they read that text, so a command gives the same value on both protocols.
+// ok is false for every other type.
+func scalarText(v protocol.Value) (s string, ok bool) {
+	switch v.Type {
+	case protocol.TyDouble:
+		return formatDouble(v.Float), true
+	case protocol.TyBool:
+		if v.Bool {
+			return "1", true
+		}
+		return "0", true
+	case protocol.TyBigInt:
+		return string(v.BigN), true
+	}
+	return "", false
+}
+
+// formatDouble renders f the way the server writes a double in a RESP2 bulk
+// string (Redis 7.2 and later, Valkey; d2string in the server): "inf", "-inf"
+// and "nan"; a whole number that fits in half the int64 range, as an integer
+// with all its digits; any other number as the shortest digits that read back
+// to f, with no exponent from 1e-6 up to the point where it would take seven or
+// more trailing zeros, and an exponent without padding ("1e+20", "1.5e-10")
+// beyond. A RESP3 double is a float64 here, so this is the text that the server
+// sent, not the one a Go format verb gives (%g writes 1e+06 for 1000000).
+func formatDouble(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "nan"
+	case math.IsInf(f, 1):
+		return "inf"
+	case math.IsInf(f, -1):
+		return "-inf"
+	case f == 0:
+		if math.Signbit(f) {
+			return "-0"
+		}
+		return "0"
+	}
+	if f == math.Trunc(f) && f >= -(1<<62) && f <= 1<<62 {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	sign := ""
+	if f < 0 {
+		sign, f = "-", -f
+	}
+	e := strconv.FormatFloat(f, 'e', -1, 64) // d[.ddd]e[+-]XX
+	i := strings.IndexByte(e, 'e')
+	digits := strings.Replace(e[:i], ".", "", 1)
+	exp10, _ := strconv.Atoi(e[i+1:])
+	nd := len(digits)
+	k := exp10 - (nd - 1) // f = digits * 10^k
+	exp := exp10
+	if exp < 0 {
+		exp = -exp
+	}
+	switch {
+	case k >= 0 && exp < nd+7:
+		return sign + digits + strings.Repeat("0", k)
+	case k < 0 && (k > -7 || exp < 4):
+		off := nd + k // digits before the point
+		if off > 0 {
+			return sign + digits[:off] + "." + digits[off:]
+		}
+		return sign + "0." + strings.Repeat("0", -off) + digits
+	}
+	mant := digits[:1]
+	if nd > 1 {
+		mant += "." + digits[1:]
+	}
+	esign := "+"
+	if exp10 < 0 {
+		esign = "-"
+	}
+	return sign + mant + "e" + esign + strconv.Itoa(exp)
 }
 
 // stripVerbatimPrefix drops the 4-byte "xxx:" RESP3 verbatim-string prefix
@@ -153,6 +237,13 @@ func asInt(v protocol.Value) (int64, error) {
 	case protocol.TyNull:
 		return 0, ErrNil
 	default:
+		// A boolean, a double with no fraction and a big number that fits
+		// read as the text RESP2 sends (see scalarText).
+		if s, ok := scalarText(v); ok {
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return n, nil
+			}
+		}
 		return 0, fmt.Errorf("celeris-redis: expected int reply, got %s", v.Type)
 	}
 }
@@ -163,6 +254,8 @@ func asFloat(v protocol.Value) (float64, error) {
 		return v.Float, nil
 	case protocol.TyBulk, protocol.TySimple:
 		return strconv.ParseFloat(string(v.Str), 64)
+	case protocol.TyBigInt:
+		return strconv.ParseFloat(string(v.BigN), 64)
 	case protocol.TyNull:
 		return 0, ErrNil
 	default:
@@ -177,29 +270,76 @@ func asBool(v protocol.Value) (bool, error) {
 	case protocol.TyInt:
 		return v.Int != 0, nil
 	case protocol.TyBulk, protocol.TySimple:
-		switch string(v.Str) {
-		case "1", "true", "TRUE", "True":
-			return true, nil
-		case "0", "false", "FALSE", "False":
-			return false, nil
-		}
-		return false, fmt.Errorf("celeris-redis: cannot decode bulk %q as bool", v.Str)
+		return boolFromText(string(v.Str))
 	case protocol.TyNull:
 		return false, ErrNil
 	}
+	// A double or a big number reads as the text RESP2 sends (see scalarText).
+	if s, ok := scalarText(v); ok {
+		return boolFromText(s)
+	}
 	return false, fmt.Errorf("celeris-redis: expected bool reply, got %s", v.Type)
+}
+
+func boolFromText(s string) (bool, error) {
+	switch s {
+	case "1", "true", "TRUE", "True":
+		return true, nil
+	case "0", "false", "FALSE", "False":
+		return false, nil
+	}
+	return false, fmt.Errorf("celeris-redis: cannot decode %q as bool", s)
+}
+
+// elemString reads one element of an array, set or map the way RESP2 sends
+// it: a bulk string (the common case) as is, a null (a missing MGET key) as
+// "", and an integer, double, boolean, big number, simple string or verbatim
+// string as its text. An element that is no string (a nested array, set or
+// map, or an error) is an error that names its type, never an empty string.
+func elemString(e protocol.Value) (string, error) {
+	switch e.Type {
+	case protocol.TyBulk, protocol.TySimple:
+		return string(e.Str), nil
+	case protocol.TyNull:
+		return "", nil
+	case protocol.TyInt:
+		return strconv.FormatInt(e.Int, 10), nil
+	case protocol.TyVerbatim:
+		return string(stripVerbatimPrefix(e.Str)), nil
+	}
+	if s, ok := scalarText(e); ok {
+		return s, nil
+	}
+	return "", fmt.Errorf("celeris-redis: expected a string element, got %s", e.Type)
 }
 
 func asStringSlice(v protocol.Value) ([]string, error) {
 	switch v.Type {
 	case protocol.TyArray, protocol.TySet:
 		out := make([]string, len(v.Array))
-		for i, elem := range v.Array {
-			switch elem.Type {
-			case protocol.TyNull:
-				out[i] = ""
-			default:
+		for i := range v.Array {
+			elem := &v.Array[i]
+			if elem.Type == protocol.TyBulk {
 				out[i] = string(elem.Str)
+				continue
+			}
+			s, err := elemString(*elem)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = s
+		}
+		return out, nil
+	case protocol.TyMap:
+		// A RESP3 map reads as the flat key, value array RESP2 sends.
+		out := make([]string, 0, 2*len(v.Map))
+		for i := range v.Map {
+			for _, e := range [2]*protocol.Value{&v.Map[i].K, &v.Map[i].V} {
+				s, err := elemString(*e)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, s)
 			}
 		}
 		return out, nil
@@ -213,6 +353,46 @@ func asStringSlice(v protocol.Value) ([]string, error) {
 	return nil, fmt.Errorf("celeris-redis: expected array reply, got %s", v.Type)
 }
 
+// hasPairsOption reports whether args ask for the member and its score (or
+// field and value) in the reply: WITHSCORES or WITHVALUES. RESP2 sends those
+// as one flat list; RESP3 sends a list of [member, score] pairs.
+func hasPairsOption(args []any) bool {
+	for _, a := range args {
+		var s string
+		switch x := a.(type) {
+		case string:
+			s = x
+		case []byte:
+			s = string(x)
+		default:
+			continue
+		}
+		if strings.EqualFold(s, "WITHSCORES") || strings.EqualFold(s, "WITHVALUES") {
+			return true
+		}
+	}
+	return false
+}
+
+// flattenPairs turns a RESP3 array of two-element arrays into the flat array
+// RESP2 sends. It reports false, and v is left as it is, when v is not an
+// array whose elements are all arrays of two.
+func flattenPairs(v protocol.Value) (protocol.Value, bool) {
+	if v.Type != protocol.TyArray || len(v.Array) == 0 {
+		return v, false
+	}
+	for i := range v.Array {
+		if v.Array[i].Type != protocol.TyArray || len(v.Array[i].Array) != 2 {
+			return v, false
+		}
+	}
+	flat := make([]protocol.Value, 0, 2*len(v.Array))
+	for i := range v.Array {
+		flat = append(flat, v.Array[i].Array[0], v.Array[i].Array[1])
+	}
+	return protocol.Value{Type: protocol.TyArray, Array: flat}, true
+}
+
 func asStringMap(v protocol.Value) (map[string]string, error) {
 	if v.Type == protocol.TyNull {
 		return nil, ErrNil
@@ -220,8 +400,21 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 	switch v.Type {
 	case protocol.TyMap:
 		out := make(map[string]string, len(v.Map))
-		for _, kv := range v.Map {
-			out[string(kv.K.Str)] = string(kv.V.Str)
+		for i := range v.Map {
+			kv := &v.Map[i]
+			if kv.K.Type == protocol.TyBulk && kv.V.Type == protocol.TyBulk {
+				out[string(kv.K.Str)] = string(kv.V.Str)
+				continue
+			}
+			k, err := elemString(kv.K)
+			if err != nil {
+				return nil, err
+			}
+			val, err := elemString(kv.V)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = val
 		}
 		return out, nil
 	case protocol.TyArray:
@@ -230,7 +423,19 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 		}
 		out := make(map[string]string, len(v.Array)/2)
 		for i := 0; i < len(v.Array); i += 2 {
-			out[string(v.Array[i].Str)] = string(v.Array[i+1].Str)
+			if v.Array[i].Type == protocol.TyBulk && v.Array[i+1].Type == protocol.TyBulk {
+				out[string(v.Array[i].Str)] = string(v.Array[i+1].Str)
+				continue
+			}
+			k, err := elemString(v.Array[i])
+			if err != nil {
+				return nil, err
+			}
+			val, err := elemString(v.Array[i+1])
+			if err != nil {
+				return nil, err
+			}
+			out[k] = val
 		}
 		return out, nil
 	case protocol.TyNull:
@@ -1032,11 +1237,14 @@ func (c *Client) Watch(ctx context.Context, fn func(tx *Tx) error, keys ...strin
 		c.pool.discardCmd(conn)
 		return err
 	}
-	conn.releaseResult(req)
-	if req.resultErr != nil {
+	// Read the reply's error before releaseResult hands the request back to
+	// its pool, where the next command on any goroutine reuses it.
+	if werr := req.resultErr; werr != nil {
+		conn.releaseResult(req)
 		c.pool.discardCmd(conn)
-		return req.resultErr
+		return werr
 	}
+	conn.releaseResult(req)
 
 	tx := &Tx{
 		client: c,

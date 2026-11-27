@@ -31,8 +31,10 @@
 //   - [NewClusterClient] ([ClusterClient]) and [NewSentinelClient]
 //     ([SentinelClient]) cover Redis Cluster and Sentinel deployments.
 //
-// Typed accessors and pipeline/Do results are detached from the reader buffer,
-// so returned values are safe to retain. Server error replies surface as
+// Values returned by Client methods, [Client.Do] and the typed Cmds of a [Tx]
+// are copies, safe to retain. Values read from a [Pipeline] (its typed Cmds)
+// are valid until [Pipeline.Release] or [Pipeline.Discard]: copy what you
+// keep. Server error replies surface as
 // [*RedisError] (with sentinels such as [ErrNil], [ErrWrongType],
 // [ErrCrossSlot]); see [errors.Is]. TLS (rediss://) is not yet supported.
 //
@@ -99,6 +101,13 @@
 // held are bounded by the pool's MaxOpen ([Config.PoolSize], default 4 times
 // GOMAXPROCS) and unbounded with a negative PoolSize. Pub/sub and the other pools
 // are not affected, and no other platform has the poll(2) wait.
+//
+// # Errors from writes
+//
+// An error from a write does not prove that the write was not applied: a
+// connection that closes right after the server answered can be reported as a
+// failure (celeris#1460); do not blindly retry Incr, Decr or other
+// non-idempotent commands on a connection error.
 //
 // # Documentation
 //

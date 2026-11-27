@@ -52,6 +52,8 @@ results/
 .claude/worktrees/
 fullstack
 *.json
+# the supported-types tables the docs site is built from (test/internal/supporttable)
+!test/conformance/*/testdata/supported.json
 benchmark_analysis.py
 .claude/scheduled_tasks.lock
 .sse_engine_test

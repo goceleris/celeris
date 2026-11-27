@@ -99,8 +99,9 @@ func (l *Loop) driverEpollCtl(op, fd int, ev *unix.EpollEvent) error {
 }
 
 // closeEpollFD closes the loop's epoll descriptor and refuses every later
-// driver epoll_ctl. Runs on the loop thread at the very end of shutdown,
-// holding no other lock. Idempotent.
+// driver epoll_ctl. Runs on the loop thread at the very end of shutdown, and
+// from run's two early returns when its init fails (shutdown never runs
+// then), holding no other lock. Idempotent.
 func (l *Loop) closeEpollFD() {
 	l.ctlMu.Lock()
 	fd := l.epollFD

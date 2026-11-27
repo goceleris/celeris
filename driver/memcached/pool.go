@@ -2,6 +2,8 @@ package memcached
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 
@@ -155,6 +157,11 @@ func (p *memcachedPool) acquire(ctx context.Context, hint int) (*memcachedConn, 
 		}
 		c, err := p.pool.Acquire(ctx, hint)
 		if err != nil {
+			if errors.Is(err, async.ErrPoolClosed) || errors.Is(err, eventloop.ErrLoopClosed) {
+				// After Client.Close (the pool is closed, the loop it owned is released, a dial
+				// met it): the driver's ErrClosed, not the internal packages' errors.
+				return nil, fmt.Errorf("%w: %w", ErrClosed, err)
+			}
 			return nil, err
 		}
 		if c.closed.Load() {

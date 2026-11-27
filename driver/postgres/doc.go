@@ -16,9 +16,20 @@
 // [Open] accepts both the libpq URL form and the key=value DSN form. Pool
 // behavior is tuned with functional [Option] values: [WithEngine],
 // [WithMaxOpen], [WithMaxIdlePerWorker], [WithMaxLifetime], [WithMaxIdleTime],
-// [WithHealthCheck], [WithStatementCacheSize], and [WithApplication].
-// [WithEngine] is optional and affects performance only: when set, the pool
-// shares the HTTP server's event loop instead of resolving a standalone one.
+// [WithHealthCheck], [WithStatementCacheSize], [WithMaxResultBytes] and
+// [WithApplication].
+// [WithEngine] is optional. When set on a server that has not started yet, the
+// pool shares the HTTP server's event loop instead of resolving a standalone
+// one; a bare [Open] and [WithEngine] on a server that has started or runs
+// async handlers give a direct-mode pool, whose results are capped at 64 MiB by
+// default (see [ErrResultTooBig]: always check [Rows.Err]).
+//
+// database/sql connections are direct too, by default: sql.Open and a [Connector]
+// read each reply whole on the calling goroutine, with the same cap
+// ([Connector.WithMaxResultBytes]). [Connector.WithStreaming], or streaming=true in
+// the DSN, puts them on the event loop, which streams a result and has no cap, at
+// the cost of the limits its godoc lists (a Connector bound to a started epoll,
+// io_uring or adaptive server is direct all the same: see [Connector.WithStreaming]).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
@@ -27,7 +38,11 @@
 // [Tx.Rollback], and savepoint helpers ([Tx.Savepoint],
 // [Tx.ReleaseSavepoint], [Tx.RollbackToSavepoint]). Bulk loads use
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
-// [Pool.CopyTo].
+// [Pool.CopyTo]. A call to [Tx.Commit] or [Tx.Rollback] ends the Tx whatever it
+// returns: a failed Commit is not retried on the same Tx, every later call on the
+// Tx returns [ErrTxDone] (a deferred Rollback after a failed Commit is safe), and
+// its connection is released: back to the pool if the driver knows the session is
+// idle, discarded otherwise.
 //
 // Server errors surface as [*PGError] carrying the SQLSTATE code; match
 // with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],
@@ -65,6 +80,22 @@
 // (open, or failed by a statement) is logged at Warn on slog.Default, the first
 // time and then at most once a minute. See the Session state section of
 // [Pool].
+//
+// # Errors from writes
+//
+// An error from a write does not prove that the write was not applied. This
+// holds for [Pool.ExecContext] and [Tx.ExecContext], for [Pool.QueryRow] and
+// [Tx.QueryRow] with a statement that has RETURNING (an INSERT, UPDATE or
+// DELETE ... RETURNING statement is a write), and for [Tx.Commit].
+//
+// A call whose reply was cut off by a lost connection returns an error, not a
+// result that looks complete (celeris#1459). The error can also be returned for
+// a call whose reply had arrived completely, when the server closes the
+// connection right after it: the write was applied and the call still reports a
+// connection failure. This is a known limit (celeris#1470). Do not blindly retry
+// a statement that is not idempotent (an INSERT without a unique key, an UPDATE
+// that adds to a value) after a connection error: check the state first, or make
+// the statement safe to repeat.
 //
 // # Documentation
 //
