@@ -117,6 +117,17 @@ func (p *sweepProbe885) window(l *Loop, from, to int64) []int64 {
 	return w
 }
 
+// sweptLoops is every loop that has swept.
+func (p *sweepProbe885) sweptLoops() []*Loop {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ls := make([]*Loop, 0, len(p.at))
+	for l := range p.at {
+		ls = append(ls, l)
+	}
+	return ls
+}
+
 // loops is the number of loops that swept, and how many conns the loop that
 // holds the detached conn had at its last sweep.
 func (p *sweepProbe885) loops() (n int, detLoop *Loop, detLive int) {
@@ -278,6 +289,9 @@ func newBusy885(t *testing.T, addr string) *busy885 {
 // The timerfd alone sweeps 40 times a second, so about 60 sweeps are due in the
 // window and the floor must not let the gate add to that; a gate without the
 // floor sweeps every 32 iterations, which on a busy loop is thousands a second.
+// Since celeris#1430 a loop walks its connections when something is due, so the
+// count is an upper bound only, and the lower bound is one walk on each loop
+// (the safety cap of a second).
 func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 	addr, p := startFloorEngine885(t, resource.Config{})
 	b := newBusy885(t, addr)
@@ -311,8 +325,12 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 	// A loop whose connections have nothing due walks them about once a second
 	// (the safety cap of celeris#1430), not at every tick; what the floor must
 	// not do is starve the sweep altogether.
-	if sweeps < nLoops {
-		t.Errorf("only %d sweeps in %v on %d loops: the floor starved the sweep (a loop walks at least once in about a second)", sweeps, span, nLoops)
+	// The bound is per loop: a total over the loops would pass with one loop
+	// starved.
+	for _, l := range p.sweptLoops() {
+		if n := len(p.window(l, mono.FromTime(from), mono.FromTime(to))); n < 1 {
+			t.Errorf("a loop made no sweep in %v (%d in all on %d loops): the floor starved its sweep (a loop walks at least once in about a second)", span, sweeps, nLoops)
+		}
 	}
 }
 
