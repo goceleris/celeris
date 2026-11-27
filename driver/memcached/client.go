@@ -31,7 +31,9 @@ type Client struct {
 // vs gomc on the MSR1 bench from ~17% to within noise.
 //
 // When opened WithEngine, the mini-loop sync path (WriteAndPollBusy) is
-// used so DB I/O colocates with the celeris HTTP engine's worker.
+// used so DB I/O colocates with the celeris HTTP engine's worker, unless the
+// server runs async handlers (Config.AsyncHandlers or an .Async() route, an
+// unset Config.Engine included): the client then uses direct connections.
 //
 // addr may optionally include a "memcache://" or "memcached://" scheme
 // prefix; the prefix is stripped and the remaining "host:port" is used

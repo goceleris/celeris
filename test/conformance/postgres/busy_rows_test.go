@@ -324,12 +324,12 @@ func busyOpenNativeTx(t *testing.T) *busyEnv {
 }
 
 // busyPoolOnLoop reports whether the native Pool of this CELERIS_CONFORMANCE_ENGINE
-// arm runs on the event loop (and streams a large result). Of the arms that
-// bind the Pool to a server, only "default" does (measured: the others, the
-// started ones and the explicit epoll, run the Pool in direct mode, which
-// buffers the whole result); a bare Open is direct as well.
+// arm runs on the event loop (and streams a large result). None does: the arms
+// that bind the Pool to a server have an async route, which makes the Pool
+// direct (it buffers the whole result) whether the engine is explicit or unset,
+// started or not (celeris#1376); a bare Open is direct as well.
 func busyPoolOnLoop() bool {
-	return os.Getenv("CELERIS_CONFORMANCE_ENGINE") == "default"
+	return false
 }
 
 // busySQLDirect reports whether the database/sql connections of this arm are

@@ -800,8 +800,9 @@ type Config struct {
 	// ceiling (NumWorkers × 1/RTT) is replaced by goroutine-per-connection
 	// parallelism, matching net/http's concurrency model.
 	//
-	// When AsyncHandlers is set, celeris drivers opened WithEngine(srv) auto-
-	// select their direct net.Conn path (Go netpoll parks handler Gs on
+	// When AsyncHandlers is set (an unset Engine counts as the engine Start
+	// resolves it to), celeris drivers opened WithEngine(srv) auto-select
+	// their direct net.Conn path (Go netpoll parks handler Gs on
 	// EPOLLIN without blocking an M), validated on MSR1 at celeris-epoll +
 	// celerismc jumping from 64k → 105k rps.
 	//
