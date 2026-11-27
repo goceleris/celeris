@@ -317,10 +317,9 @@ type Config struct {
 	// met at the sweeps' own period, as it was: a connection inside an async
 	// handler, an HTTP/2 deadline set from a pool goroutine, and a WebSocket idle
 	// deadline moved by the middleware. An HTTP/2 stream whose request never
-	// arrives is reset when ReadTimeout falls due, within the same bound, and the
-	// connection is closed by a following sweep, which is one sweep more than an
-	// HTTP/1 connection takes. WriteTimeout is judged in windows that end at a
-	// sweep too: see
+	// arrives is reset when ReadTimeout falls due, within the same bound; the
+	// connection is closed later, and that close is not covered by this bound.
+	// WriteTimeout is judged in windows that end at a sweep too: see
 	// WriteTimeout. The HTTP/1 header deadline, and the budget of a connection
 	// whose protocol is not decided yet, have a timer of their own on io_uring and
 	// are not late; the HTTP/2 header-block bound of ReadHeaderTimeout is checked
