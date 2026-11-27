@@ -316,6 +316,9 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 	if reqs < 1000 {
 		t.Fatalf("PREMISE: the loop was not busy: %d requests in %v", reqs, span)
 	}
+	if nLoops != 2 {
+		t.Fatalf("PREMISE: %d loops swept, the engine has 2 (a loop that never swept would not be checked below)", nLoops)
+	}
 	// 40 a second a loop from the timerfd; slack for jitter and a sweep at
 	// each edge of the window.
 	if lim := nLoops * (int(span/sweepFloor) + 20); sweeps > lim {
