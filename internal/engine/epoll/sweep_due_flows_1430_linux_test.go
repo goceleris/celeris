@@ -36,11 +36,36 @@ package epoll
 //     every min(due, ...) that dates it, and that sweepHorizon takes each timeout
 //     named.
 //
-// What it does not see: types (fields are matched by name), a clock whose stamp
-// comes from another package than conn's H1State (an HTTP/2 deadline: those pin
-// the loop, sweepDue), and a clock set through a helper that is not the
-// assignment itself (a function that returns the stamp, which the caller stores
-// and the scan sees).
+// WHAT THIS DOES NOT CATCH. This is a tripwire: it makes the next person who adds
+// a clock, or moves a place that starts one, stop and look at the next-due rule.
+// It does not check meaning. The behavioural tests of #1485 (a deadline of each
+// kind set, the close observed on time) are the proof for the sites that exist
+// today.
+//
+//   - A start site whose look is wrong but has the right shape: a hook's call must
+//     follow the statement in its block, with no return or branch between, and
+//     pass exactly the field just set (no arithmetic); nothing more is checked,
+//     so a hook that sits in a branch the clock does not reach is not seen.
+//   - An "event", "later", "sweep" or "pinned" site is believed: only its
+//     right-hand side is checked, for a subtraction or a product (a clock set
+//     back).
+//   - A look that is too late for the deadline it is for, where the call passes the
+//     right field (lowerNextDue takes no other argument than the stamp, so this
+//     is about the stamp, not the call).
+//   - Fields are matched by name, not type; a clock stored through a helper that
+//     is not the assignment, or in a composite literal, is not seen.
+//   - A clock from another package than conn's H1State (an HTTP/2 deadline) is not
+//     parsed: those pin the loop (sweepDue).
+//   - dirty is not scanned: it is pinned through dirtyHead, which the structural
+//     test checks in sweepDue.
+//   - A timeout read under another name (a copy of the configuration) is not
+//     followed by the horizon test.
+//   - A new clock of the table whose class is "own", "copy" or "pin": its
+//     start sites are not scanned.
+//   - The idle look (lastActivity with idleBound) is looked for anywhere in the
+//     walk, not in a branch of its own: a walk that dates it only for the
+//     connections in one state passes this test (the behavioural test
+//     TestNextDueIsTheEarliestOfWhatTheWalkSees1430 has the rows).
 
 import (
 	"go/ast"
@@ -53,13 +78,29 @@ import (
 	"testing"
 )
 
-// startFields1430 are the connState fields whose assignment (to anything but 0)
-// starts or moves a clock the walk accounts for by a hook or by the safety cap.
-var startFields1430 = map[string]bool{
-	"writeSince":     false,
-	"closeSince":     false,
-	"lastActivity":   false,
-	"detectDeadline": false,
+// snapshotCopies1430 are the fields of the snapshot of a connection's HTTP/1
+// deadlines: copies made inside the walk, whose clocks are HeaderDeadlineNs
+// (armed in internal/conn: TestWalkClocksAreMadeOfTheTimeoutsTheHorizonTakes1430)
+// and IdleDeadlineNs (pinned).
+var snapshotCopies1430 = map[string]bool{"hdrDL": true, "idleDL": true}
+
+// startFields1430 derives the fields whose statements are scanned from the table
+// of the structural test: every clock the sweep reads that the walk dates
+// ("walk"), looks at again at every tick ("rearm") or that a hook starts
+// ("hook"). A clock added to sweepClocks1430 (the structural test fails until it
+// is) is scanned from then on, so that its start sites must be listed in
+// startSites1430.
+func startFields1430() map[string]bool {
+	out := map[string]bool{}
+	for f, site := range sweepClocks1430 {
+		switch site.class {
+		case "walk", "rearm", "hook":
+			if !snapshotCopies1430[f] {
+				out[f] = true
+			}
+		}
+	}
+	return out
 }
 
 // startSite1430 is one place that sets a clock field.
@@ -90,6 +131,13 @@ var startSites1430 = []startSite1430{
 		why: "in the sweep: the peer's acknowledged bytes restart the drain at the look"},
 	{fn: "detachedStalled", field: "closeSince", kind: "pinned",
 		why: "the stall clock of a detached conn: the loop holds a detached conn, so sweepDue never skips it (checked below)"},
+
+	// The sampled clocks and the grace of a detached reap: set in the sweep, and the
+	// branch that reads them reports "look again soon".
+	{fn: "noteClosingAcked", field: "closeSampled", kind: "sweep", why: "in the sweep: the drain's sample, taken at the look the walk rearms"},
+	{fn: "detachedStalled", field: "closeSampled", kind: "sweep", why: "in the sweep: the stall's sample, taken at the look the detached branch rearms"},
+	{fn: "parkedBelowRate", field: "closeSampled", kind: "sweep", why: "in the sweep: the write-rate window's sample, at the look the write branch rearms"},
+	{fn: "checkTimeouts", field: "drainDeadline", kind: "sweep", why: "in the sweep: the grace of a detached connection's reap, rearmed by the detached branch"},
 
 	// The idle and read clock: an event, dated by the walk that follows.
 	{fn: "acceptAll", field: "lastActivity", kind: "event",
@@ -360,9 +408,11 @@ type found1430 struct {
 	file, fn, field string
 	block           ast.Node
 	rhs             []ast.Expr
+	stmt            ast.Stmt
+	lhs, val        ast.Expr // the selector set, and what it is set to
 }
 
-func clockStarts1430(files map[string]*ast.File) []found1430 {
+func clockStarts1430(files map[string]*ast.File, fields map[string]bool) []found1430 {
 	var out []found1430
 	var names []string
 	for n := range files {
@@ -391,11 +441,13 @@ func clockStarts1430(files map[string]*ast.File) []found1430 {
 					if !ok {
 						continue
 					}
-					if _, isField := startFields1430[se.Sel.Name]; !isField {
+					if !fields[se.Sel.Name] {
 						continue
 					}
-					if len(as.Rhs) == len(as.Lhs) && as.Tok == token.ASSIGN {
-						if bl, ok := as.Rhs[i].(*ast.BasicLit); ok && bl.Value == "0" {
+					var val ast.Expr
+					if len(as.Rhs) == len(as.Lhs) {
+						val = as.Rhs[i]
+						if bl, ok := val.(*ast.BasicLit); ok && as.Tok == token.ASSIGN && bl.Value == "0" {
 							continue
 						}
 					}
@@ -411,7 +463,7 @@ func clockStarts1430(files map[string]*ast.File) []found1430 {
 						}
 						break
 					}
-					out = append(out, found1430{file: name, fn: fd.Name.Name, field: se.Sel.Name, block: block, rhs: as.Rhs})
+					out = append(out, found1430{file: name, fn: fd.Name.Name, field: se.Sel.Name, block: block, rhs: as.Rhs, stmt: as, lhs: se, val: val})
 				}
 				return true
 			})
@@ -420,10 +472,43 @@ func clockStarts1430(files map[string]*ast.File) []found1430 {
 	return out
 }
 
-// callInBlock1430 reports whether one of the statements that are in the block
-// itself (not in a block of a statement inside it: that is another path) makes a
-// call to one of names.
-func callInBlock1430(block ast.Node, names []string) bool {
+// leaves1430 reports whether st holds a return or a branch statement (break,
+// continue, goto), outside a function literal.
+func leaves1430(st ast.Stmt) bool {
+	found := false
+	ast.Inspect(st, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.ReturnStmt, *ast.BranchStmt:
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// exprText1430 prints an identifier or selector chain, "" for anything else.
+func exprText1430(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return x.Name
+	case *ast.SelectorExpr:
+		if b := exprText1430(x.X); b != "" {
+			return b + "." + x.Sel.Name
+		}
+	}
+	return ""
+}
+
+// callAfter1430 looks, among the statements of the block that start is in, for
+// one after start that calls one of names with exactly want as its argument
+// (want "" accepts any). It says why there is none: "" when there is one,
+// "absent" when no statement of the block itself calls it after the start,
+// "leaves" when a statement between the start and the call returns or branches
+// (the call is then not reached on every path from the start), "argument" when
+// the call is there and passes something else than want.
+func callAfter1430(block, start ast.Node, names []string, want string) string {
 	var list []ast.Stmt
 	switch b := block.(type) {
 	case *ast.BlockStmt:
@@ -431,28 +516,65 @@ func callInBlock1430(block ast.Node, names []string) bool {
 	case *ast.CaseClause:
 		list = b.Body
 	}
-	for _, st := range list {
-		switch st.(type) {
-		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt, *ast.BlockStmt, *ast.LabeledStmt:
-			continue
-		}
-		found := false
-		ast.Inspect(st, func(n ast.Node) bool {
-			if c, ok := n.(*ast.CallExpr); ok {
-				switch f := c.Fun.(type) {
-				case *ast.SelectorExpr:
-					found = found || containsStr1430(names, f.Sel.Name)
-				case *ast.Ident:
-					found = found || containsStr1430(names, f.Name)
-				}
-			}
-			return !found
-		})
-		if found {
-			return true
+	i := -1
+	for k, st := range list {
+		if ast.Node(st) == start {
+			i = k
 		}
 	}
-	return false
+	if i < 0 {
+		return "absent"
+	}
+	why := "absent"
+	for k := i + 1; k < len(list); k++ {
+		st := list[k]
+		switch st.(type) {
+		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt, *ast.BlockStmt, *ast.LabeledStmt:
+			if leaves1430(st) {
+				return "leaves"
+			}
+			continue
+		}
+		var call *ast.CallExpr
+		ast.Inspect(st, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok && call == nil {
+				switch f := c.Fun.(type) {
+				case *ast.SelectorExpr:
+					if containsStr1430(names, f.Sel.Name) {
+						call = c
+					}
+				case *ast.Ident:
+					if containsStr1430(names, f.Name) {
+						call = c
+					}
+				}
+			}
+			return call == nil
+		})
+		if call != nil {
+			if want == "" || (len(call.Args) == 1 && exprText1430(call.Args[0]) == want) {
+				return ""
+			}
+			why = "argument"
+			continue
+		}
+		if leaves1430(st) {
+			return "leaves"
+		}
+	}
+	return why
+}
+
+// backdates1430 reports whether e subtracts or multiplies.
+func backdates1430(e ast.Expr) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		if b, ok := n.(*ast.BinaryExpr); ok && (b.Op == token.SUB || b.Op == token.MUL) {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 func containsStr1430(s []string, x string) bool {
@@ -481,8 +603,19 @@ func checkStarts1430(found []found1430, list []startSite1430) []string {
 			continue
 		}
 		seen[k] = true
-		if s.kind == "hook" && !callInBlock1430(f.block, s.dues) {
-			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and its block does not call "+strings.Join(s.dues, " or ")+": "+s.why)
+		if s.kind != "hook" {
+			if f.val != nil && backdates1430(f.val) {
+				probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" to a value that is earlier than now or scaled (a subtraction or a product), and its entry says it ("+s.kind+") only moves the clock later: "+s.why)
+			}
+			continue
+		}
+		switch callAfter1430(f.block, f.stmt, s.dues, exprText1430(f.lhs)) {
+		case "absent":
+			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and its block does not call "+strings.Join(s.dues, " or ")+" after it: "+s.why)
+		case "leaves":
+			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and a return or branch lies between it and the call of "+strings.Join(s.dues, " or ")+": a path from the start does not reach the look: "+s.why)
+		case "argument":
+			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and calls "+strings.Join(s.dues, " or ")+" with something other than "+exprText1430(f.lhs)+" itself (no arithmetic, no other field): the look must be at the stamp: "+s.why)
 		}
 	}
 	for _, s := range list {
@@ -518,7 +651,7 @@ func packageFiles1430(t *testing.T, dir string) map[string]*ast.File {
 
 func TestEveryStartOfAClockLowersItsOwnLook1430(t *testing.T) {
 	files := packageFiles1430(t, ".")
-	found := clockStarts1430(files)
+	found := clockStarts1430(files, startFields1430())
 	if len(found) < 15 {
 		t.Fatalf("the scan found %d statements that set a clock field, want about 20: it no longer sees the package", len(found))
 	}
@@ -601,10 +734,7 @@ func TestWalkClocksAreMadeOfTheTimeoutsTheHorizonTakes1430(t *testing.T) {
 	// 3. Every statement that sets one of the clocks is made of the timeouts the
 	// table says (the accept budget), and so is every arm of the header deadline
 	// (internal/conn).
-	for _, f := range clockStarts1430(packageFiles1430(t, ".")) {
-		if f.field != "detectDeadline" {
-			continue
-		}
+	for _, f := range clockStarts1430(packageFiles1430(t, "."), map[string]bool{"detectDeadline": true}) {
 		set := map[string]bool{}
 		for _, r := range f.rhs {
 			for k := range namesIn1430(r) {
@@ -726,18 +856,55 @@ func other(l *L, cs *C) {
 	}
 	cs.closeSince = mono.Now()
 }
+func markEarlyReturn(l *L, cs *C, pending int) {
+	cs.closeSince = mono.Now()
+	if pending == 0 {
+		return
+	}
+	l.lowerNextDue(cs.closeSince)
+}
+func markLate(l *L, cs *C) {
+	cs.closeSince = mono.Now()
+	l.lowerNextDue(cs.closeSince + int64(time.Hour))
+}
+func markOtherField(l *L, cs *C) {
+	cs.closeSince = mono.Now()
+	l.lowerNextDue(cs.writeSince)
+}
+func markBefore(l *L, cs *C) {
+	l.lowerNextDue(cs.closeSince)
+	cs.closeSince = mono.Now()
+}
+func backdater(cs *C, now int64) {
+	cs.lastActivity = now - 5
+}
+func parkAgain(cs *C) {
+	cs.parkedAt = mono.Now()
+}
 `
-	found := clockStarts1430(map[string]*ast.File{"p.go": parse(pkg)})
+	fields := map[string]bool{"writeSince": true, "closeSince": true, "lastActivity": true, "parkedAt": true}
+	found := clockStarts1430(map[string]*ast.File{"p.go": parse(pkg)}, fields)
 	probs := strings.Join(checkStarts1430(found, []startSite1430{
 		{fn: "armEpollOut", field: "writeSince", kind: "hook", dues: []string{"lowerNextDue"}},
 		{fn: "handleWritable", field: "writeSince", kind: "hook", dues: []string{"lowerNextDue"}},
 		{fn: "other", field: "closeSince", kind: "hook", dues: []string{"lowerNextDue"}},
+		{fn: "markEarlyReturn", field: "closeSince", kind: "hook", dues: []string{"lowerNextDue"}},
+		{fn: "markLate", field: "closeSince", kind: "hook", dues: []string{"lowerNextDue"}},
+		{fn: "markOtherField", field: "closeSince", kind: "hook", dues: []string{"lowerNextDue"}},
+		{fn: "markBefore", field: "closeSince", kind: "hook", dues: []string{"lowerNextDue"}},
+		{fn: "backdater", field: "lastActivity", kind: "later"},
 		{fn: "gone", field: "closeSince", kind: "later"},
 	}), "\n")
 	for _, want := range []string{
 		"newParker sets writeSince and is not in startSites1430",
-		"handleWritable sets writeSince and its block does not call lowerNextDue",
-		"other sets closeSince and its block does not call lowerNextDue",
+		"parkAgain sets parkedAt and is not in startSites1430",
+		"handleWritable sets writeSince and its block does not call lowerNextDue after it",
+		"other sets closeSince and its block does not call lowerNextDue after it",
+		"markEarlyReturn sets closeSince and a return or branch lies between it and the call",
+		"markLate sets closeSince and calls lowerNextDue with something other than cs.closeSince itself",
+		"markOtherField sets closeSince and calls lowerNextDue with something other than cs.closeSince itself",
+		"markBefore sets closeSince and its block does not call lowerNextDue after it",
+		"backdater sets lastActivity to a value that is earlier than now or scaled",
 		"lists gone setting closeSince",
 	} {
 		if !strings.Contains(probs, want) {
@@ -745,6 +912,6 @@ func other(l *L, cs *C) {
 		}
 	}
 	if strings.Contains(probs, "armEpollOut") {
-		t.Errorf("checkStarts1430 reported armEpollOut, whose block calls lowerNextDue:\n%s", probs)
+		t.Errorf("checkStarts1430 reported armEpollOut, whose block calls lowerNextDue with the stamp just set:\n%s", probs)
 	}
 }
