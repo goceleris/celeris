@@ -204,6 +204,12 @@ const idleWakeBound1381 = 40
 // a container the loops' own count was 18 or 19 rounds in 2 s and the thread's
 // switches 21 to 40 in the same windows. The switches are still logged, not
 // asserted.
+//
+// What the test no longer catches: a thread that blocks somewhere other than in
+// the loop's own rounds (a lock, a channel, a syscall inside a handler), because
+// only rounds are counted; and an epoll_wait that returns on a signal (EINTR)
+// and is retried, which is not counted as a round. The logged switches would
+// show both.
 func idleWaitRate1381(p *idleProbe1381, l *Loop, from time.Time, window time.Duration) (rate float64, rounds uint32, ok bool) {
 	s := p.of(l)
 	s.mu.Lock()
