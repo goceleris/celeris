@@ -316,14 +316,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.4"
           # The CodSpeed Go runner builds with its own fresh GOCACHE and
           # GOMODCACHE, so a restored setup-go cache would never be read.
           cache: false
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
+        uses: CodSpeedHQ/action@b1f28b5eccf7cb5bfe6a2a89cb3053eb67f1150c # v5.8.0
         env:
           # Frame-pointer unwinding: DWARF unwinding leaves Go flamegraphs
           # incomplete on arm64 (https://codspeed.io/docs/benchmarks/go).
