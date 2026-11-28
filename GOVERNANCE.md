@@ -159,6 +159,7 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
   is experimental follows the experimental level: today that is
   `observe.Snapshot`'s `ValidationCounters` field, of type
   `validation.Counters`, which exists only under `-tags=validation`.
+- **The database drivers are beta in v1.6.0** (`driver/postgres`, `driver/redis` and `driver/memcached`). The exported API of the driver packages stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types per driver: [PostgreSQL](https://goceleris.dev/docs/postgres-types), [Redis](https://goceleris.dev/docs/redis-replies), [memcached](https://goceleris.dev/docs/memcached-behavior).
 - **Not covered:**
   - Every package with an `internal` element in its import path:
     `internal/**`, `driver/internal/**`, `middleware/internal/**` and
@@ -178,8 +179,10 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
     driver test addresses such as `CELERIS_PG_DSN`, and the numbered
     ones such as `CELERIS_589_*`).
 
-The tuning variables the engines read at startup (the README's
-[table](README.md#tuning-environment-variables) says what each does):
+The tuning variables the engines read at startup, and the Redis driver on
+first use (the
+[runtime notes](https://goceleris.dev/docs/runtime-notes#tuning-environment-variables)
+say what each does):
 
 | Variable | Level |
 |---|---|
@@ -188,6 +191,7 @@ The tuning variables the engines read at startup (the README's
 | `CELERIS_IOURING_SEND_ZC` | supported |
 | `CELERIS_IOURING_MULTISHOT_RECV` | experimental |
 | `CELERIS_IOURING_PBUF_COUNT` | experimental |
+| `CELERIS_REDIS_DIRECT_WAIT` | experimental |
 | `CELERIS_IOURING_FIXED_FILES` | unsupported |
 | `CELERIS_ADAPTIVE_DEBUG` | unsupported |
 | `CELERIS_DEBUG_*` | unsupported |
