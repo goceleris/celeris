@@ -721,6 +721,15 @@ type Worker struct {
 	// (celeris#884 item 62). Worker-owned.
 	sweepMarks int
 	lastSweep  int64
+	// nextDue is the time (mono) the last sweep, and the sites that arm a deadline
+	// since, say the next look at a deadline is due; 0 when none is known. The
+	// loop sweeps then as well as at the gate, the ceiling and the standing timer
+	// (celeris#1430, sweepDue and dueAt in sweep_gate_884.go). Worker thread.
+	nextDue int64
+	// sweepTickAt is when the standing sweep timer, while outstanding, fires
+	// (mono), so that a next look lowered after it was armed is not waited past
+	// (sweepTickOK). Worker thread.
+	sweepTickAt int64
 	// sweepTickArmed is set while the worker's standing sweep timer (an
 	// IORING_OP_TIMEOUT, udSweepTick) is outstanding in the kernel, and
 	// sweepTickFired when its CQE has come and no sweep has run since
@@ -1813,7 +1822,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) && (w.sweepTickArmed || w.armSweepTick()) {
+			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) && w.sweepTickOK() {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
 				// Not once the context is cancelled (celeris#806): a SEND to a
@@ -2587,6 +2596,9 @@ func (w *Worker) armHeaderTimerAt(cs *connState, dl int64) {
 	}
 	cs.headerTimerSpec.Sec = remaining / int64(time.Second)
 	cs.headerTimerSpec.Nsec = remaining % int64(time.Second)
+	// The sweep is the timer's fallback (the SQE can be dropped): its next look
+	// is no later than the deadline (celeris#1430).
+	w.dueAt(dl+1, now)
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		// Ring full — submit pending SQEs to drain, then retry.
@@ -2649,12 +2661,14 @@ func (w *Worker) sweptTimeout() time.Duration {
 	// the cap that matters, because the case the sweep exists for — a
 	// standby worker with no listen socket and only idle keep-alives — is
 	// exactly the one the 1 s below applies to.
+	// Every return is capped at the next look (celeris#1430): a connection's
+	// deadline that falls due inside the wait ends the wait there.
 	if d, owed := w.sweepWait(); owed {
 		if w.listenFD < 0 || d < w.baseTimeout() {
-			return d
+			return w.dueCap(d)
 		}
 	}
-	return w.baseTimeout()
+	return w.dueCap(w.baseTimeout())
 }
 
 // capToDeadline caps a ring-wait timeout at the time left to deadline (on
@@ -2803,6 +2817,9 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 
 	cs.lastActivity = now
+	// The idle and read clock of the new conn starts: the next look at it
+	// (celeris#1430).
+	w.dueIdleFrom(now, now)
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
 	// upgrades too", so route it through the recv-time detection path (like
@@ -3937,6 +3954,9 @@ func (w *Worker) switchToH2(cs *connState) error {
 		w.h2PollArmed = w.prepareH2Poll()
 	}
 	w.h2Conns = append(w.h2Conns, cs.fd)
+	// The upgrade's first frames were taken by switchToH2Local: a request or
+	// header block deadline may be armed (celeris#1430).
+	w.dueH2(cs.h2State, w.cachedNow)
 	return nil
 }
 
@@ -4542,9 +4562,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			if cs.detachMu != nil {
 				cs.detachMu.Lock()
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+				w.dueH2(cs.h2State, now)
 				cs.detachMu.Unlock()
 			} else {
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+				w.dueH2(cs.h2State, now)
 			}
 		}
 	}
@@ -5371,6 +5393,11 @@ func (w *Worker) closeConn(fd int) {
 		// for. cachedNow (not time.Now) keeps the churn-close close path free
 		// of a vDSO call; its ~100 ms staleness is noise against a 5 s bound.
 		cs.lastActivity = w.cachedNow
+		// The drain's bound starts here, and its first sample of the peer's
+		// progress comes a quarter of it on (celeris#1430).
+		bound := w.closingDrainBound()
+		w.dueAt(cs.lastActivity+bound+1, w.cachedNow)
+		w.dueAt(w.cachedNow+bound/4, w.cachedNow)
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
@@ -6767,7 +6794,8 @@ func (cs *connState) ackedNow() (uint64, bool) {
 // reads it. Worker thread.
 func (w *Worker) sweepH2Deadlines(now int64) {
 	for i := len(w.h2Conns) - 1; i >= 0; i-- {
-		cs := w.conns[w.h2Conns[i]]
+		fd := w.h2Conns[i]
+		cs := w.conns[fd]
 		if cs == nil || cs.h2State == nil || cs.closing {
 			continue
 		}
@@ -6810,6 +6838,17 @@ func (w *Worker) sweepH2Deadlines(now int64) {
 			if w.flushSend(cs) {
 				w.markDirty(cs)
 			}
+		}
+		if w.conns[fd] != cs || cs.closing {
+			continue // closed by the sweep, or deferred: the closing drain's own looks
+		}
+		// What is left to look at: the deadlines the state still holds, and,
+		// after a request was answered or a frame written, a second look one
+		// floor on, which judges the conn by the clock the answer leaves
+		// (celeris#1430).
+		w.dueH2(cs.h2State, now)
+		if res.Wrote || res.Expired > 0 {
+			w.dueAt(now+sweepFloor, now)
 		}
 	}
 }
@@ -7074,6 +7113,10 @@ func (w *Worker) drainDetachQueue() {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
 			w.h2Conns = append(w.h2Conns, cs.fd)
+			// The first frames of the upgrade were taken on the dispatch
+			// goroutine: a deadline may be armed that no sweep has seen
+			// (celeris#1430).
+			w.dueH2(cs.h2State, w.cachedNow)
 			w.markDirty(cs)
 			continue
 		}
@@ -7509,6 +7552,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.sending = true
 		cs.kernelInflight++
 		w.sendsPending = true
+		w.dueWrite(cs)
 		// A remainder: the first SEND of this response took part of it and the
 		// peer is taking the rest slowly or not at all (celeris#884 item 62).
 		// Its completion is the client's to give, so the worker must not wait
@@ -7546,6 +7590,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
+	w.dueWrite(cs)
 	return false
 }
 
@@ -7702,6 +7747,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
+	w.dueWrite(cs)
 	return false
 }
 
@@ -7887,6 +7933,10 @@ func (w *Worker) sweepDetachedStall(cs *connState, fd int, now int64) {
 	case pending:
 		if w.detachedStalled(cs, now) {
 			w.closeStalled(fd, cs, now)
+		} else {
+			// Bytes are queued and the peer has not been shown to take none for
+			// the bound: the next look at it is the next stall look.
+			w.dueAt(w.lastStallLook+w.stallLookFloor(), now)
 		}
 	case cs.stallSince != 0:
 		cs.stallSince = 0
@@ -7902,16 +7952,25 @@ func (w *Worker) sweepDetachedStall(cs *connState, fd int, now int64) {
 // samples of detachedStalled), not of an iteration. The look costs a lock
 // attempt per detached conn (BenchmarkCheckTimeouts888). Worker thread.
 func (w *Worker) stallLookDue(now int64) bool {
-	bound := int64(w.cfg.WriteTimeout)
-	if bound <= 0 {
+	floor := w.stallLookFloor()
+	if floor == 0 {
 		return false
 	}
-	floor := min(max(bound/16, int64(25*time.Millisecond)), int64(250*time.Millisecond))
 	if now-w.lastStallLook < floor && now >= w.lastStallLook {
 		return false
 	}
 	w.lastStallLook = now
 	return true
+}
+
+// stallLookFloor is the least time between two stall looks (stallLookDue), or 0
+// when WriteTimeout is off and there is nothing to look for. Worker thread.
+func (w *Worker) stallLookFloor() int64 {
+	bound := int64(w.cfg.WriteTimeout)
+	if bound <= 0 {
+		return 0
+	}
+	return min(max(bound/16, int64(25*time.Millisecond)), int64(250*time.Millisecond))
 }
 
 // closeStalled closes a detached conn whose peer took none of its queue for
@@ -7928,6 +7987,8 @@ func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
 	w.closeConn(fd)
 	if w.conns[fd] == cs && cs.closing {
 		cs.lastActivity = now - w.closingDrainBound() - 1
+		// The drain's bound is spent: the next look reaps it, one floor from now.
+		w.dueAt(now+sweepFloor, now)
 	}
 }
 
@@ -7967,6 +8028,8 @@ func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
 	// sweep's rule would take one (see noteClosingAcked's callers).
 	cs.lastActivity = now - w.closingDrainBound() + 1
 	cs.closeSampled = now + 2
+	// Out of bound at the next look, one floor from now.
+	w.dueAt(now+sweepFloor, now)
 }
 
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its
@@ -7991,7 +8054,10 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // gate hit, every 32 iterations when ReadHeaderTimeout > 0 or a conn is
 // detached, every 1024 otherwise, when sweepFloor (25 ms) has passed since the
 // last sweep; from any iteration once sweepCeiling (1 s) has; and with
-// sendWatch set (sweepWatchDue) about every 1 to 2 s. An idle iteration waits
+// sendWatch set (sweepWatchDue) about every 1 to 2 s; and from any iteration at
+// the time the last sweep (or an arm site since) found a deadline falling due
+// (dueNow, celeris#1430), the ring wait being cut at that time (dueCap). An idle
+// iteration waits
 // up to 25 / 50 / 100 ms (baseTimeout; 1 s on a worker with no listener, one
 // paused or on standby), so an idle worker sweeps about every 0.8 s with
 // ReadHeaderTimeout > 0 (32 iterations of 25 ms) and about every second
@@ -8001,15 +8067,21 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // SEND's completion (waitUntimed) no iteration runs; the standing timer
 // (armSweepTick) ends that wait within sweepCeiling.
 //
-// What rides on the sweep, and so is enforced up to one sweep period late (a
-// period of about 0.8 s on an idle worker: measured 0.83 s, celeris#1189): the
-// idle, read and write timeouts, the WebSocket idle deadline, the HTTP/2
-// deadlines, and the closing drain. The HTTP/1 header deadline and the budget of
-// a conn whose protocol is not decided yet (detectDeadline) have a timer of
-// their own in the kernel (armHeaderTimer, armed at the accept for the latter)
-// and are met within milliseconds; the sweep is their fallback for a timer the
-// ring could not take. epoll's sweep is a 25 ms timerfd, so it is late by at most
-// that when ReadHeaderTimeout is set.
+// What rides on the sweep: the idle, read and write timeouts, the WebSocket idle
+// deadline, the HTTP/2 deadlines, and the closing drain. Each sweep works out the
+// earliest time at which one of them could fall due (nextDue, see dueAt) and the
+// loop sweeps then, as well as at the sweeps above, so a deadline that the
+// computation knows is met when it falls due (celeris#1430; the tests bound the
+// close within 200 ms of the due time on a loaded runner), and one it does not
+// know (a conn inside an async handler, an HTTP/2 deadline lowered from a pool
+// goroutine, a WebSocket deadline moved by the middleware) is met at the period
+// of the sweeps above, up to one sweep period late (about 0.8 s on an idle
+// worker: measured 0.83 s, celeris#1189), as it was. The HTTP/1 header deadline
+// and the budget of a conn whose protocol is not decided yet (detectDeadline)
+// have a timer of their own in the kernel (armHeaderTimer, armed at the accept
+// for the latter) and are met within milliseconds; the sweep is their fallback for
+// a timer the ring could not take. epoll's sweep is a 25 ms timerfd, so it is
+// late by at most that when ReadHeaderTimeout is set.
 //
 // This replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
@@ -8026,6 +8098,9 @@ func (w *Worker) checkTimeouts() {
 	passClock := w.cachedNow
 	w.lastSweep = now
 	w.sweepTickFired = false
+	// The next look is worked out again from what this sweep sees; the sites
+	// that arm a deadline lower it as they run (celeris#1430, dueAt).
+	w.nextDue = 0
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(w)
 	}
@@ -8118,6 +8193,11 @@ func (w *Worker) checkTimeouts() {
 				(now-cs.lastActivity > bound && cs.closeSampled <= cs.lastActivity+bound)) {
 				w.noteClosingAcked(cs, now)
 			}
+			// The reap, and the next sample of the peer's progress.
+			w.dueAt(cs.lastActivity+bound+1, now)
+			if !cs.fixedFile {
+				w.dueAt(cs.closeSampled+bound/4, now)
+			}
 			if now-cs.lastActivity > bound {
 				// Everything closeConn does before deferring (detach
 				// signalling, CloseH1, detachedCount) has already run, so
@@ -8164,9 +8244,12 @@ func (w *Worker) checkTimeouts() {
 		// dispatch goroutine yet (the first bytes decide that), so
 		// cs.detected and the deadline are the worker's own and need no lock
 		// (celeris#974).
-		if !cs.detected && cs.detectDeadline > 0 && now > cs.detectDeadline {
-			w.closeConn(fd)
-			continue
+		if !cs.detected && cs.detectDeadline > 0 {
+			if now > cs.detectDeadline {
+				w.closeConn(fd)
+				continue
+			}
+			w.dueAt(cs.detectDeadline+1, now)
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
@@ -8189,6 +8272,7 @@ func (w *Worker) checkTimeouts() {
 		// engine-config-driven timeouts do not apply to a detached conn —
 		// the middleware owns its I/O lifecycle.
 		if h1Detached {
+			w.dueAt(idleDL+1, now)
 			if idleDL > 0 && now > idleDL {
 				w.closeConn(fd)
 			} else if stallLook {
@@ -8199,9 +8283,21 @@ func (w *Worker) checkTimeouts() {
 		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
 		// (handled by closeConn → finishCloseDetached fastClose branch).
 		// See handleHeaderTimer for the rationale (mirrors net/http).
-		if hdrDL > 0 && now > hdrDL {
-			w.closeConn(fd)
-			continue
+		if hdrDL > 0 {
+			if now > hdrDL {
+				w.closeConn(fd)
+				continue
+			}
+			w.dueAt(hdrDL+1, now)
+		}
+		// The next look at this conn: its idle clock against ReadTimeout and
+		// IdleTimeout whatever it is doing (a conn with a send in flight is judged
+		// by WriteTimeout now and by the idle clock when the send completes), and
+		// the write clock while it has output. A deadline already past contributes
+		// nothing (dueAt): an exempt conn is left to the sweeps' own period.
+		w.dueIdleFrom(cs.lastActivity, now)
+		if cs.dirty || cs.sending || cs.zcNotifPending {
+			w.dueWrite(cs)
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty || cs.sending || cs.zcNotifPending {
@@ -8229,6 +8325,7 @@ func (w *Worker) checkTimeouts() {
 			// starts its idle timer when the last stream closes). Not
 			// lastActivity, which is the WriteTimeout clock of the arm above.
 			if at := cs.h2OwedAt; at != 0 && !w.timeoutsDue(time.Duration(now-at)) {
+				w.dueIdleFrom(cs.h2OwedAt, now)
 				continue
 			}
 			w.closeConn(fd)
@@ -8241,6 +8338,7 @@ func (w *Worker) checkTimeouts() {
 	w.sendWatch = sendOut || w.sweepMarks > 0
 	w.remainderN = remN + w.sweepMarks
 	w.remainderWatch = w.remainderN > 0
+	w.finishDue(now)
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,

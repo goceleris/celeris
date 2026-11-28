@@ -189,6 +189,8 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	// Adoptions come one per handed-off connection, so the vDSO call is off the
 	// request path.
 	cs.lastActivity = mono.Now()
+	// The adopted conn's idle and read clock starts here (celeris#1430).
+	w.dueIdleFrom(cs.lastActivity, cs.lastActivity)
 
 	// #383 adopts HTTP/1 keep-alive conns only; lock the protocol and install a
 	// fresh parser at the request boundary.
