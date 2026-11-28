@@ -159,7 +159,7 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
   is experimental follows the experimental level: today that is
   `observe.Snapshot`'s `ValidationCounters` field, of type
   `validation.Counters`, which exists only under `-tags=validation`.
-- **The database drivers are beta in v1.6.0** (`driver/postgres`, `driver/redis` and `driver/memcached`). The exported API of the driver packages stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types per driver: [[PLACEHOLDER: link to the supported-types pages]].
+- **The database drivers are beta in v1.6.0** (`driver/postgres`, `driver/redis` and `driver/memcached`). The exported API of the driver packages stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types per driver: [PostgreSQL](https://goceleris.dev/docs/postgres-types), [Redis](https://goceleris.dev/docs/redis-replies), [memcached](https://goceleris.dev/docs/memcached-behavior).
 - **Not covered:**
   - Every package with an `internal` element in its import path:
     `internal/**`, `driver/internal/**`, `middleware/internal/**` and
@@ -180,8 +180,9 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
     ones such as `CELERIS_589_*`).
 
 The tuning variables the engines read at startup, and the Redis driver on
-first use (the README's
-[table](README.md#tuning-environment-variables) says what each does):
+first use (the
+[runtime notes](https://goceleris.dev/docs/runtime-notes#tuning-environment-variables)
+say what each does):
 
 | Variable | Level |
 |---|---|
