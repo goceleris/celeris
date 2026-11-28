@@ -113,7 +113,7 @@ The figures come from a cross-framework benchmark on dedicated x86-64 and arm64 
 - **Linux is the production platform.** macOS and Windows run the `Std` engine, for development and testing.
 - **The database clients are beta** (see Status above).
 - **Idle CPU with open connections.** On the native engines, a server that holds connections open and is otherwise idle uses more CPU than a plain `net/http` server ([#1478](https://github.com/goceleris/celeris/issues/1478)).
-- **Light-load tail latency.** In one WebSocket echo run (64 connections, one arm64 container), the p99 of the epoll and adaptive engines was about twice the `Std` engine's; it is not shown to hold for HTTP in general ([#1380](https://github.com/goceleris/celeris/issues/1380)).
+- **Light-load tail latency.** At light load the native engines' WebSocket echo p99 was about twice the `Std` engine's in two arm64 measurements ([#1318](https://github.com/goceleris/celeris/issues/1318), [#1380](https://github.com/goceleris/celeris/issues/1380)); not measured for HTTP.
 
 The full list for v1.6.0, with issue links, is in [Known limits in v1.6.0](https://goceleris.dev/docs/known-limits).
 
