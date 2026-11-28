@@ -85,6 +85,9 @@ func TestTimeoutSentinelReachesEngine(t *testing.T) {
 				// worker carrying it reproduces the gate exactly.
 				// listenFD >= 0 = not draining; emptyIters > 100 = idle,
 				// which is the branch that returns the cap.
+				// This worker has no wake eventfd, so it is not one that holds nothing
+				// (idleQuiescent, celeris#1381): it keeps the cap. The worker that does
+				// hold nothing is in idle_wait_state_1381_linux_test.go.
 				w := &Worker{cfg: e.cfg, listenFD: 3, emptyIters: 200}
 				idle := w.adaptiveTimeout()
 				gateForcedByHeader := w.cfg.ReadHeaderTimeout > 0

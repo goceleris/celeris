@@ -134,6 +134,10 @@ func WithHealthCheckInterval(d time.Duration) Option {
 // The driver takes the server's event loop once, when it is opened: open it after
 // srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
 // driver's own loop for its whole life.
+//
+// The command pool dials direct connections when the server runs async handlers
+// (the server's Config.AsyncHandlers or an .Async() route; an unset Config.Engine
+// counts), whenever it is opened; Pub/Sub stays on the loop.
 func WithEngine(sp ServerProvider) Option {
 	return func(c *Config) { c.Engine = sp }
 }

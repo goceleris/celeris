@@ -1,6 +1,6 @@
 module github.com/goceleris/celeris/test/drivercmp/redis
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/goceleris/celeris v1.5.11

@@ -26,13 +26,77 @@ import (
 // reaped by the conn clock (it restarts it): the per-stream deadlines bound its
 // streams. The last test pins that for a response.
 
+// The time a silent client may hold its connection on each engine, derived from
+// the engines' timeout sweeps (celeris#889; the numbers are in the code, quoted
+// here so that the bar is the code's and not a fit to a run):
+//
+//   - epoll sweeps every 25 ms from a timerfd (Config.ReadTimeout: "within about
+//     30 ms"), so every step below costs a few tens of milliseconds and the bar is
+//     the deadline plus reap889, unchanged.
+//   - io_uring has no timer for these deadlines: the deadlines of an HTTP/2
+//     stream, the conn's own ReadTimeout and WriteTimeout ride on the worker's
+//     timeout sweep (iouring/worker.go checkTimeouts: "enforced up to one sweep
+//     period late"). A worker that has no traffic sweeps once sweepCeiling (1 s,
+//     iouring/sweep_gate_884.go) has passed, noticed at the end of an iteration
+//     whose ring wait is up to 100 ms (baseTimeout): at most ioSweep889 apart.
+//     This client sends nothing after its request, so the worker is idle. (A
+//     client that pings every 500 ms keeps the sweeps at their 25 ms floor: its
+//     stream is reset at 2.09 s, see TestH2PingingClientHoldsAnUnfinishedStream889.)
+//
+// What the silent client costs in sweeps on io_uring:
+//
+//   - request-open: ReadTimeout runs per request (408 and RST_STREAM) from its
+//     HEADERS: the first sweep after it resets the stream (up to one sweep
+//     period late). That sweep leaves a SEND in flight (the 408 and the RST), so
+//     the same sweep judges the conn by its WriteTimeout clock, not its read
+//     clock (checkTimeouts: `cs.dirty || cs.sending`), and the conn is closed by
+//     the next sweep: 2 sweeps after ReadTimeout.
+//   - response-*-untaken: the response waits for the window, so WriteTimeout
+//     bounds it as a minimum rate in windows that end at a sweep (Config.
+//     WriteTimeout: "between WriteTimeout and WriteTimeout plus two sweeps after
+//     the response parked": the first sweep takes the baseline, the window ends at
+//     the first sweep a WriteTimeout later); the stream is reset then and the
+//     conn closed by the next sweep: WriteTimeout plus 3 sweeps.
+//
+// Passing runs of this test on the CI runner (24 ci.yml Unit jobs, 48 transfers
+// per cell, memlock 8 MiB, the io_uring worker capped to one) closed io_uring at
+// 2.02-2.06 s (request-open) and 3.13-3.96 s (response-8MiB-untaken, median
+// 3.61 s) and epoll and adaptive at 1.00-1.03 s and 2.00-2.20 s: the io_uring
+// times are the sweep chain above (ReadTimeout + 1 sweep, WriteTimeout + 1 to 2
+// sweeps), not a hang; the old bar of 4 s sat inside that range, and one run
+// closed at about 4.02 s.
+const (
+	// wt889 is the WriteTimeout of silentServer889.
+	wt889 = 2 * time.Second
+	// ioSweep889 is the longest the sweeps of an idle io_uring worker are apart:
+	// sweepCeiling (1 s) plus one ring wait of up to 100 ms.
+	ioSweep889 = 1100 * time.Millisecond
+	// ioMargin889 is the slack for a loaded host (race, coverage, a shared
+	// runner) on top of the derived time.
+	ioMargin889 = time.Second
+)
+
+// reapBar889 is how long after the client's request the connection of a silent
+// client may take to be closed on the engine, for the cell: the deadline that
+// bounds it, the sweeps the engine needs after it (see the constants above), and
+// the margin. A server that never closes it fails whatever the engine.
+func reapBar889(engine, cell string) time.Duration {
+	if engine != "io_uring" {
+		return to889 + reap889
+	}
+	if cell == "request-open" {
+		return to889 + 2*ioSweep889 + ioMargin889
+	}
+	return wt889 + 3*ioSweep889 + ioMargin889
+}
+
 // silentServer889 is the server of these cells: /upload889 (POST, answers ok
 // once its body is whole), /big889 (a 1 MiB or, with ?n=8388608, an 8 MiB
 // body), /hold889 (an SSE-like stream), all on sync or async routes.
 func silentServer889(t *testing.T, eng celeris.EngineType, syncRoutes bool) string {
 	t.Helper()
 	var ended atomic.Bool
-	cfg := celeris.Config{Engine: eng, ReadTimeout: to889, IdleTimeout: -1, WriteTimeout: 2 * time.Second}
+	cfg := celeris.Config{Engine: eng, ReadTimeout: to889, IdleTimeout: -1, WriteTimeout: wt889}
 	return startServerConfig761(t, cfg, func(s *celeris.Server) {
 		holdRoute889(s, 30*time.Second, &ended)
 		r1 := s.POST("/upload889", func(c *celeris.Context) error { return c.String(200, "ok") })
@@ -110,11 +174,12 @@ func TestH2SilentClientOwingTheServerIsReaped889(t *testing.T) {
 					addr := silentServer889(t, e.eng, syncRoutes)
 					c := dialH2raw889(t, addr, h2dial889{})
 					sc.req(c)
-					o := c.watch(0, to889+reap889)
+					bar := reapBar889(e.name, sc.name)
+					o := c.watch(0, bar)
 					t.Logf("H2OWES889 engine=%s routes=%s cell=%s: %s", e.name, routeMode889(syncRoutes), sc.name, o)
 					if o.open {
-						t.Fatalf("the connection was still open %v after the client's request: it owes the server (%s) and sent nothing, want it closed by ReadTimeout %v within %v",
-							o.at.Round(time.Millisecond), sc.name, to889, to889+reap889)
+						t.Fatalf("the connection was still open %v after the client's request: it owes the server (%s) and sent nothing, want it closed within %v (ReadTimeout %v, WriteTimeout %v, and the engine's sweeps: see reapBar889)",
+							o.at.Round(time.Millisecond), sc.name, bar, to889, wt889)
 					}
 				})
 			}

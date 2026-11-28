@@ -13,9 +13,14 @@ import (
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
-// celeris#1228: see the redis driver's test of the same name. The Connector is
-// the entry point that registers connections on the engine's loop: a Pool on a
-// native engine dials through Go's netpoll and sets no socket option.
+// celeris#1228: see the redis driver's test of the same name. A Connector with
+// WithStreaming bound to a server that has not started registers its connections
+// on the driver's own loop and takes the server's budget (a Connector without
+// WithStreaming dials direct connections, see
+// busy_poll_direct_default_linux_test.go; one with it bound to a started epoll,
+// io_uring or adaptive server dials direct too, see
+// TestConnectorOnAStartedServerSetsNoBusyPoll). A Pool on a native engine dials
+// through Go's netpoll as well.
 func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 	base := sockoptstest.Baseline(t)
 	for _, tc := range []struct {
@@ -27,7 +32,7 @@ func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 		{"server 37us", 37 * time.Microsecond, 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := busypolltest.StartServer(t, tc.d)
+			srv := busypolltest.NewServer(tc.d) // not started: the driver's own loop
 			addr := startFakePG(t, func(c net.Conn) {
 				fakePGTrustStartup(t, c, 42, 0x1ABCD123, func(c net.Conn) { _, _ = io.Copy(io.Discard, c) })
 			})
@@ -36,7 +41,7 @@ func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("connector: %v", err)
 			}
-			cn = cn.WithEngine(srv)
+			cn = cn.WithEngine(srv).WithStreaming()
 			defer func() { _ = cn.Close() }()
 			dc, err := cn.Connect(context.Background())
 			if err != nil {
@@ -78,7 +83,8 @@ func newFakePGConnector(t *testing.T) *Connector {
 	return cn
 }
 
-// A driver on a server with busy poll off makes no SO_BUSY_POLL call.
+// A driver on a server with busy poll off makes no SO_BUSY_POLL call (a server
+// that has not started: the connection is on the driver's own loop).
 func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -89,8 +95,8 @@ func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 		{"server 37us", 37 * time.Microsecond, []int{37}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := busypolltest.StartServer(t, tc.d)
-			cn := newFakePGConnector(t).WithEngine(srv)
+			srv := busypolltest.NewServer(tc.d)
+			cn := newFakePGConnector(t).WithStreaming().WithEngine(srv)
 			t.Cleanup(func() { _ = cn.Close() })
 			calls := recordSetsockopt(t)
 			connectorSocket(t, cn)
@@ -104,11 +110,12 @@ func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 
 // The Connector's own option sets the budget on a standalone loop and wins over
 // the server's, whichever of it and WithEngine comes first; with neither a
-// server's value nor an option, the standalone Connector stays off.
+// server's value nor an option, the standalone Connector stays off. The servers
+// have not started, so the connections are on the driver's own loop.
 func TestConnectorSocketBusyPollOption(t *testing.T) {
 	base := sockoptstest.Baseline(t)
-	srvOn := busypolltest.StartServer(t, 37*time.Microsecond)
-	srvOff := busypolltest.StartServer(t, 0)
+	srvOn := busypolltest.NewServer(37 * time.Microsecond)
+	srvOff := busypolltest.NewServer(0)
 	for _, tc := range []struct {
 		name  string
 		build func(cn *Connector) *Connector
@@ -137,7 +144,7 @@ func TestConnectorSocketBusyPollOption(t *testing.T) {
 		}, 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cn := tc.build(newFakePGConnector(t))
+			cn := tc.build(newFakePGConnector(t).WithStreaming())
 			t.Cleanup(func() { _ = cn.Close() })
 			c := connectorSocket(t, cn)
 			if got := busypolltest.BusyPoll(t, c.fd); got != tc.want {
@@ -186,6 +193,40 @@ func TestPoolSocketBusyPoll(t *testing.T) {
 			}
 			if got := busypolltest.BusyPoll(t, fd); got != tc.want {
 				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d)", got, tc.want, base)
+			}
+		})
+	}
+}
+
+// A Connector bound to a started epoll server dials through Go's netpoll (direct
+// mode), the way a Pool does, so no SO_BUSY_POLL is set on its connections
+// whatever the server's budget or the Connector's own option: the connection is
+// not on an event loop.
+func TestConnectorOnAStartedServerSetsNoBusyPoll(t *testing.T) {
+	base := sockoptstest.Baseline(t)
+	srv := busypolltest.StartServer(t, 37*time.Microsecond)
+	for _, tc := range []struct {
+		name  string
+		build func(cn *Connector) *Connector
+	}{
+		{"server 37us", func(cn *Connector) *Connector { return cn.WithStreaming().WithEngine(srv) }},
+		{"server 37us, option 29us", func(cn *Connector) *Connector {
+			return cn.WithStreaming().WithEngine(srv).WithSocketBusyPoll(29 * time.Microsecond)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cn := tc.build(newFakePGConnector(t))
+			t.Cleanup(func() { _ = cn.Close() })
+			calls := recordSetsockopt(t)
+			c := connectorSocket(t, cn)
+			if !c.useDirect {
+				t.Fatal("the connection is not direct")
+			}
+			if polls, _ := busyPollCalls(*calls); len(polls) != 0 {
+				t.Errorf("SO_BUSY_POLL calls = %v, want none", polls)
+			}
+			if got := busypolltest.BusyPoll(t, c.tcpFd); got != base {
+				t.Errorf("SO_BUSY_POLL = %d, want the baseline %d", got, base)
 			}
 		})
 	}

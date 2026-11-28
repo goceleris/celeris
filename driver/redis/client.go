@@ -10,6 +10,11 @@ import (
 
 // Client is the high-level handle users interact with. It owns a pool of
 // connections and hands out per-command round trips.
+//
+// An error from a write command (Set, Del, Incr, ... and Do) does not prove that
+// the write was not applied: a connection that closes right after the server
+// answered can be reported as a failure (celeris#1460); do not blindly retry
+// Incr, Decr or other non-idempotent commands on a connection error.
 type Client struct {
 	cfg  Config
 	pool *redisPool
@@ -145,7 +150,9 @@ func (c *Client) IdleConnWorkers() []int {
 // (OBJECT ENCODING, CLUSTER INFO, SCRIPT LOAD, XADD, FUNCTION, ...). Args
 // are converted to strings via [argify]; the returned [Value] is
 // detached from the Reader buffer and safe to retain. Server error replies
-// surface as [*RedisError] via the returned error.
+// surface as [*RedisError] via the returned error. An error from a write command
+// does not prove that it was not applied: see Errors from writes in the package
+// documentation.
 func (c *Client) Do(ctx context.Context, args ...any) (*Value, error) {
 	if len(args) == 0 {
 		return nil, errors.New("celeris-redis: Do requires at least one argument")
@@ -187,7 +194,9 @@ func (c *Client) Do(ctx context.Context, args ...any) (*Value, error) {
 }
 
 // DoString is a convenience wrapper around [Client.Do] that decodes the reply
-// as a string.
+// as a string. A RESP3 double, boolean or big number reads as the text RESP2
+// sends (a boolean as 1 or 0); an array, a map or a set is an error that names
+// the type.
 func (c *Client) DoString(ctx context.Context, args ...any) (string, error) {
 	v, err := c.Do(ctx, args...)
 	if err != nil {
@@ -197,7 +206,8 @@ func (c *Client) DoString(ctx context.Context, args ...any) (string, error) {
 }
 
 // DoInt is a convenience wrapper around [Client.Do] that decodes the reply
-// as an int64.
+// as an int64. A RESP3 boolean reads as 1 or 0, and a double with no fraction
+// or a big number that fits reads as the integer RESP2's bulk string holds.
 func (c *Client) DoInt(ctx context.Context, args ...any) (int64, error) {
 	v, err := c.Do(ctx, args...)
 	if err != nil {
@@ -217,11 +227,21 @@ func (c *Client) DoBool(ctx context.Context, args ...any) (bool, error) {
 }
 
 // DoSlice is a convenience wrapper around [Client.Do] that decodes the reply
-// as a string slice.
+// as a string slice, read the way RESP2 sends it: an integer, double, boolean
+// or big number element is its text, a null element is "", and a RESP3 map is
+// the flat key, value list. When the command has the WITHSCORES or WITHVALUES
+// option, RESP3's list of [member, score] pairs is flattened to the list RESP2
+// sends. An element that is no string (a nested array or map, or an error) is
+// an error that names its type, never an empty string.
 func (c *Client) DoSlice(ctx context.Context, args ...any) ([]string, error) {
 	v, err := c.Do(ctx, args...)
 	if err != nil {
 		return nil, err
+	}
+	if v.Type == TyArray && len(v.Array) > 0 && v.Array[0].Type == TyArray && hasPairsOption(args) {
+		if flat, ok := flattenPairs(*v); ok {
+			return asStringSlice(flat)
+		}
 	}
 	return asStringSlice(*v)
 }

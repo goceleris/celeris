@@ -132,10 +132,15 @@ type Config struct {
 	// established; the reserve is provisional, its effect on latency is still
 	// being measured, and it may change (celeris#756, #757). A Workers you set
 	// is honoured as it is, so to opt out of the reserve set Workers to
-	// runtime.GOMAXPROCS(0): on such a host that starts one loop per P, as
-	// before the reserve (on a big.LITTLE host the default is not reduced, see
-	// below, and a Workers set above the non-little CPUs wraps loops over
-	// them). What follows the loop count follows the loops started: Metrics.Workers,
+	// max(2, runtime.GOMAXPROCS(0)): on such a host that starts one loop per P,
+	// as before the reserve (on a big.LITTLE host the default is not reduced,
+	// see below, and a Workers set above the non-little CPUs wraps loops over
+	// them). The minimum of a Workers you set is 2: a 1 is refused when the
+	// server starts (Start returns a config validation error, "workers must be
+	// >= 2 if set, got 1", on every engine), so on a host with one CPU the
+	// recipe is max(2, ...), which is 2, and runtime.GOMAXPROCS(0) alone, which
+	// is 1 there, fails. Leave Workers unset to take the default, which starts 2
+	// loops on such a host (io_uring fewer when RLIMIT_MEMLOCK caps it). What follows the loop count follows the loops started: Metrics.Workers,
 	// the server-wide limit of MaxConns, and a driver pool sized from the
 	// engine's NumWorkers (a PostgreSQL pool opened with WithEngine, whose
 	// default of 4*NumWorkers is 56, not 64, on 16 CPUs). A pool sized from
@@ -300,14 +305,26 @@ type Config struct {
 	// kernel timer each worker arms whatever ReadHeaderTimeout and the timeouts
 	// are, so within about 30 ms (a 1 s IdleTimeout closed an idle connection at
 	// 1.00 to 1.03 s on docker arm64 with 2 CPUs, with ReadHeaderTimeout off as well
-	// as set). On io_uring the sweep of an idle worker is about 0.8 s apart (0.83 s
-	// measured; about 1 s with ReadHeaderTimeout off), so a timeout of a few
-	// seconds or less is approximate by that much there. WriteTimeout is judged in
-	// windows that end at a sweep too: see WriteTimeout. The HTTP/1 header
-	// deadline, and the budget of a connection whose protocol is not decided yet,
-	// have a timer of their own on io_uring and are not late; the HTTP/2
-	// header-block bound of ReadHeaderTimeout is checked by the sweep and is late
-	// by up to a sweep period.
+	// as set). On io_uring a sweep also works out when the next deadline of a
+	// connection falls due, and the worker sweeps then, as well as at the sweeps it
+	// made before (about 0.8 s apart on an idle worker, about 1 s with
+	// ReadHeaderTimeout off, up to about 2 s on a paused or standby worker, which
+	// has no listener). So the ReadTimeout or IdleTimeout of an HTTP/1 connection
+	// is met when it falls due, not at the next sweep of that period: the tests
+	// bound the close within 200 ms of the due time on a loaded runner (50 ms
+	// before it at the earliest), for an idle keep-alive connection, one whose body
+	// stalls, and one held by a paused worker. A deadline the sweep cannot see is
+	// met by the sweeps made before, within their old period of its due time: a
+	// connection inside an async handler, an HTTP/2 deadline set from a pool
+	// goroutine, and a WebSocket idle deadline moved by the middleware. An HTTP/2
+	// stream whose request never
+	// arrives is reset when ReadTimeout falls due, within the same bound; the
+	// connection is closed later, and that close is not covered by this bound.
+	// WriteTimeout is judged in windows that end at a sweep too: see
+	// WriteTimeout. The HTTP/1 header deadline, and the budget of a connection
+	// whose protocol is not decided yet, have a timer of their own on io_uring and
+	// are not late; the HTTP/2 header-block bound of ReadHeaderTimeout is checked
+	// by the sweep and is late by up to a sweep period.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -403,10 +420,20 @@ type Config struct {
 	// for 4 MiB at 60s; a smaller WriteTimeout raises the floor), so size
 	// WriteTimeout with that in mind. WriteTimeout -1 is no write timeout at
 	// any rate. What the client sends is not progress: a pipelined request or
-	// an HTTP/2 PING does not hold a parked response. The times above hold
-	// with the epoll sweep at its 25 ms period, which every worker has whatever
-	// ReadHeaderTimeout and the other timeouts are; io_uring sweeps more coarsely,
-	// see ReadTimeout.
+	// an HTTP/2 PING does not hold a parked response. The times above are those
+	// of HTTP/1 and hold with the epoll sweep at its 25 ms period, which every
+	// worker has whatever ReadHeaderTimeout and the other timeouts are; over
+	// HTTP/2 the connection is closed one sweep after its stream is reset.
+	// On io_uring the sweeps are paced as ReadTimeout says: a parked HTTP/1
+	// response is closed at the first sweep after WriteTimeout has passed since its
+	// last activity, and a send that starts makes the next look at that time, so
+	// the close comes when WriteTimeout falls due, not up to a sweep period after
+	// it. For an HTTP/2 response the client does not take, the window is set by the
+	// goroutine that writes: only an inline handler's, on the loop, is looked at
+	// when it falls due; a pooled handler's (the default) is set on a pool
+	// goroutine and is met at the old period, about WriteTimeout plus three sweeps
+	// on an idle worker (a client that took 64 KiB of an 8 MiB response, with a 2 s
+	// WriteTimeout, was closed at 3.13 to 3.96 s in CI).
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
@@ -783,8 +810,9 @@ type Config struct {
 	// ceiling (NumWorkers × 1/RTT) is replaced by goroutine-per-connection
 	// parallelism, matching net/http's concurrency model.
 	//
-	// When AsyncHandlers is set, celeris drivers opened WithEngine(srv) auto-
-	// select their direct net.Conn path (Go netpoll parks handler Gs on
+	// When AsyncHandlers is set (an unset Engine counts as the engine Start
+	// resolves it to), celeris drivers opened WithEngine(srv) auto-select
+	// their direct net.Conn path (Go netpoll parks handler Gs on
 	// EPOLLIN without blocking an M), validated on MSR1 at celeris-epoll +
 	// celerismc jumping from 64k → 105k rps.
 	//

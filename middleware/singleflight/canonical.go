@@ -24,8 +24,9 @@ const maxCanonicalAE = 256
 // and 24).
 //
 // Accept-Encoding is canonical as the negotiator reads it: the list that
-// internal/negotiate.ParseInto makes of it (what c.AcceptsEncodings, and so
-// compress, uses), written as the lowercase coding, ";p" if the entry carried
+// internal/negotiate.ParseInto makes of it (what c.AcceptsEncodings uses, and
+// compress, which weighs the same entries with a copy of its own that ranks
+// equal weights by the server's order, celeris#1335), written as the lowercase coding, ";p" if the entry carried
 // a parameter other than the weight and, unless it is 1, its weight, entries
 // separated by ",", in order. So two values have one form
 // exactly when the negotiator gives them one answer: "gzip, deflate, br"

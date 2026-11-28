@@ -10,6 +10,12 @@ import (
 
 // Client is the high-level handle users interact with. It owns a pool of
 // connections and hands out per-command round trips.
+//
+// An error from a write (Set, Add, Replace, Append, Prepend, Delete, Incr, Decr,
+// Touch, CAS, Flush) does not prove that the write was not applied: a connection
+// that closes right after the server answered can be reported as a failure
+// (celeris#1460); do not blindly retry Incr, Decr or other non-idempotent
+// commands on a connection error.
 type Client struct {
 	cfg  Config
 	pool *memcachedPool
@@ -25,7 +31,9 @@ type Client struct {
 // vs gomc on the MSR1 bench from ~17% to within noise.
 //
 // When opened WithEngine, the mini-loop sync path (WriteAndPollBusy) is
-// used so DB I/O colocates with the celeris HTTP engine's worker.
+// used so DB I/O colocates with the celeris HTTP engine's worker, unless the
+// server runs async handlers (Config.AsyncHandlers or an .Async() route, an
+// unset Config.Engine included): the client then uses direct connections.
 //
 // addr may optionally include a "memcache://" or "memcached://" scheme
 // prefix; the prefix is stripped and the remaining "host:port" is used
@@ -79,7 +87,12 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	return &Client{cfg: cfg, pool: pool}, nil
 }
 
-// Close tears down every pooled connection. Safe to call on a nil Client.
+// Close closes the idle connections and the pool. A command in flight on the
+// event-loop path (a Client opened WithEngine of a server with no loop of its
+// own) fails with [ErrClosed]. A command in flight on a direct connection, which
+// is checked out of the pool, finishes with its reply or with its own deadline or
+// [Config.Timeout]. A command issued after Close returns [ErrClosed]. Safe to
+// call on a nil Client.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil

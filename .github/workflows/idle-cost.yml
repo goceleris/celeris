@@ -1,0 +1,77 @@
+name: Idle cost
+
+# celeris#1381: what an idle native-engine server costs (process CPU and the
+# wake-ups of every loop thread), what the idleness costs the first request that
+# follows it, and how long an idle server takes to shut down, on this revision
+# and on main, by the same tool (test/cmd/idlecost, which uses only the exported
+# API) on the same runner. It runs when that tool or this file changes, and by
+# hand. The numbers are a runner's, shared with other jobs and with 4 vCPUs on
+# x86: they are for the before and after on one runner, not for the figures of
+# the documentation (a Linux arm64 VM, Docker Desktop).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - test/cmd/idlecost/**
+      - .github/workflows/idle-cost.yml
+
+permissions:
+  contents: read
+
+jobs:
+  idle-cost:
+    name: Idle cost, this revision and main (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+          cache: false
+      - name: Build the tool against this revision and against main
+        shell: bash
+        run: |
+          set -euo pipefail
+          # main has no copy of the tool: the same source is built in its tree.
+          mkdir -p main/test/cmd/idlecost
+          cp head/test/cmd/idlecost/main.go main/test/cmd/idlecost/main.go
+          (cd head && go build -o /tmp/idlecost-head ./test/cmd/idlecost)
+          (cd main && go build -o /tmp/idlecost-main ./test/cmd/idlecost)
+          echo "head: $(git -C head rev-parse HEAD)"
+          echo "main: $(git -C main rev-parse HEAD)"
+      - name: Measure
+        shell: bash
+        run: |
+          set -uo pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "runner: $(uname -m), $(nproc) CPUs, kernel $(uname -r), memlock $(ulimit -l) KiB"
+          failed=0
+          # 3 loops: CPU, wake-ups, first request after 1 s, 10 s and 60 s idle, shutdown.
+          # 7 loops: CPU and wake-ups (more loops than CPUs on a 4-vCPU runner: oversubscribed).
+          for engine in epoll iouring adaptive; do
+            for build in main head; do
+              echo "=== ${build} ${engine} 3 loops ==="
+              /tmp/idlecost-"${build}" -engine "$engine" -workers 3 -window 20s -gaps 1s:5,10s:3,60s:2 || failed=$((failed + 1))
+            done
+            for build in main head; do
+              echo "=== ${build} ${engine} 7 loops (oversubscribed on 4 vCPUs) ==="
+              /tmp/idlecost-"${build}" -engine "$engine" -workers 7 -window 20s || failed=$((failed + 1))
+            done
+          done
+          echo "runs failed: $failed (want 0)"
+          [ "$failed" -eq 0 ]

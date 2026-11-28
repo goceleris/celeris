@@ -240,6 +240,7 @@ func (c *redisConn) awaitDirectReplies(ctx context.Context, mode directWaitKind,
 			c.onRecv(c.syncBuf[:rn])
 		}
 		if err != nil {
+			err = ctxIOError(ctx, err)
 			_ = c.closeWithErr(err)
 			return err
 		}

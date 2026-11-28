@@ -954,7 +954,9 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 // caller runs on a LockOSThread'd worker.
 //
 // Only engines that actually implement async dispatch report true — even
-// when Config.AsyncHandlers is set. Currently:
+// when Config.AsyncHandlers is set. An unset Config.Engine counts as the engine
+// Start resolves it to (Adaptive on Linux, Std elsewhere), also before Start.
+// Currently:
 //
 //   - Epoll: async dispatch implemented; returns true when configured.
 //   - IOUring: async dispatch implemented; returns true when configured.
@@ -980,8 +982,10 @@ func (s *Server) AsyncHandlers() bool {
 	if !s.config.AsyncHandlers && !s.router.hasAsyncRoutes() {
 		return false
 	}
-	switch s.config.Engine {
-	case Epoll, IOUring, Adaptive, Std:
+	// An unset Config.Engine is the engine Start resolves it to, as
+	// SocketBusyPoll resolves it (celeris#1376).
+	switch s.config.toResourceConfig().WithDefaults().Engine {
+	case engine.Epoll, engine.IOUring, engine.Adaptive, engine.Std:
 		return true
 	default:
 		return false

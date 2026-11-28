@@ -21,6 +21,16 @@ var (
 // that does not fill the field, or for a probe that never completes.
 var probeFn = probeLoopback
 
+// wasStarted goes up when Start runs the probe's once, for a test to read.
+var wasStarted atomic.Bool
+
+// Started reports whether Start has begun the probe in this process.
+func Started() bool { return wasStarted.Load() }
+
+// Wait returns when the probe, if it has been started, has ended and closed its
+// sockets (for a test that counts the process's sockets).
+func Wait() { probing.Wait() }
+
 // Note records a count read from a socket: a count above 0 shows the stack fills
 // the field, for good.
 func Note(acked uint64) {
@@ -30,14 +40,17 @@ func Note(acked uint64) {
 }
 
 // Start begins the loopback probe in the background, once. The engines call it
-// when they are built, so that the answer is there long before a connection
-// needs it; Filled calls it too, as a safety net. It never blocks: the probe
-// waits on a loopback connection (up to a second or two if the host's loopback is
-// broken), and an event-loop thread must not.
+// once their listeners are bound (the probe binds an ephemeral loopback port, so
+// it must not run while a caller's port is still being bound), so that the
+// answer is there long before a connection needs it; Filled calls it too, as a
+// safety net. It never blocks: the probe waits on a loopback connection (up to a
+// second or two if the host's loopback is broken), and an event-loop thread must
+// not.
 func Start() {
 	started.Do(func() {
 		fn := probeFn
 		probing.Add(1)
+		wasStarted.Store(true)
 		go func() {
 			defer probing.Done()
 			if fn() {

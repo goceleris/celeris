@@ -108,6 +108,8 @@ type ClusterClient struct {
 
 	closeCh chan struct{}
 	closed  atomic.Bool
+	// beforeLostPrimaryCheck is a test seam: nil outside tests (see doWithRetryCmd).
+	beforeLostPrimaryCheck func()
 }
 
 // NewClusterClient creates a Redis Cluster client. It connects to the seed
@@ -305,6 +307,14 @@ func (c *ClusterClient) route(slot uint16) *clusterNode {
 	n := c.slots[slot]
 	c.mu.RUnlock()
 	return n
+}
+
+// isPrimary reports whether n is a primary. A topology read sets the flag under
+// c.mu (applyTopology), so it is read under c.mu too.
+func (c *ClusterClient) isPrimary(n *clusterNode) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return n.primary
 }
 
 // routeForCmd picks the target node for a command+slot combination, respecting
@@ -836,13 +846,16 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 		if !errors.As(err, &rerr) {
 			// Non-Redis error (network, etc.) on a replica: fall back to
 			// the primary once before giving up.
-			if !node.primary && !triedReplicaFallback {
+			if !c.isPrimary(node) && !triedReplicaFallback {
 				node.failing.Store(true)
 				triedReplicaFallback = true
 				if primary := c.route(slot); primary != nil {
 					node = primary
 					continue
 				}
+			}
+			if c.beforeLostPrimaryCheck != nil {
+				c.beforeLostPrimaryCheck()
 			}
 			// Non-Redis error on a primary means the master just died
 			// (crash, network partition, container stop). Without an
@@ -853,7 +866,7 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			// the node failing, force a synchronous refresh, and retry
 			// on whichever primary now owns the slot. One retry only —
 			// if the refresh also fails we bubble the original error up.
-			if node.primary && !triedPrimaryRefresh {
+			if c.isPrimary(node) && !triedPrimaryRefresh {
 				node.failing.Store(true)
 				triedPrimaryRefresh = true
 				// The commands that lost this primary share one read that
@@ -925,9 +938,11 @@ func (c *ClusterClient) doASK(ctx context.Context, cl *Client, fn func(context.C
 	if err != nil {
 		return err
 	}
-	if req.resultErr != nil {
+	// Read the reply's error before releaseResult returns the request to its
+	// pool, where the next command on any goroutine reuses it.
+	if rerr := req.resultErr; rerr != nil {
 		conn.releaseResult(req)
-		return req.resultErr
+		return rerr
 	}
 	conn.releaseResult(req)
 	pinCtx := context.WithValue(ctx, pinnedConnKey{}, conn)
@@ -1613,10 +1628,10 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 				errs[i] = askErr
 				continue
 			}
-			if req.resultErr != nil {
+			if rerr := req.resultErr; rerr != nil {
 				conn.releaseResult(req)
 				n.client.pool.releaseCmd(conn)
-				errs[i] = req.resultErr
+				errs[i] = rerr
 				continue
 			}
 			conn.releaseResult(req)

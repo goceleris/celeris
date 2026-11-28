@@ -52,7 +52,13 @@ func pauseLag886(t *testing.T, e *Engine, port, want int, gaveup time.Duration) 
 // is the guard that the 25 ms timerfd keeps the lag short; the arm with the
 // timerfd disarmed (every loop has one since celeris#1194, whatever its
 // ReadHeaderTimeout) sits in epoll_wait for up to 500 ms, which is the one the
-// eventfd signal is for.
+// eventfd signal is for. Since celeris#1381 a loop that holds nothing waits
+// 100 ms and ticks its timer at that period, and the signal is what ends that
+// wait for a pause: the no-connections arms are its guard, and a lag over 100 ms
+// there is a missed signal (the median bound of
+// TestBeginPauseAcceptReachesALoopThatIsIdle1381 is the sharp one). The disarmed
+// arms mark their loops idleWaitOff (start886), or an idle loop would re-arm the
+// timer at its first idle round and the arm would no longer be what it says.
 func TestBeginPauseAcceptReachesAnIdleLoop886(t *testing.T) {
 	const (
 		cycles   = 8
