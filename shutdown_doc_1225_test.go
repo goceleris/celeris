@@ -1,13 +1,9 @@
 package celeris_test
 
-import (
-	"os"
-	"strings"
-	"testing"
-)
+import "testing"
 
-// TestShutdownDocPartialHead1225 pins celeris#1225 on the Server.Shutdown godoc
-// and the README: a connection that has begun a request head and not finished
+// TestShutdownDocPartialHead1225 pins celeris#1225 on the Server.Shutdown
+// godoc: a connection that has begun a request head and not finished
 // it (a fragment, or a bare CRLF) is a request in progress on epoll and io_uring,
 // so Shutdown waits for it, up to the limits the text names, and a client can
 // hold a graceful shutdown that long; net/http does not count such a connection
@@ -18,6 +14,16 @@ import (
 // the issue was filed on, that net/http holds a connection with a partial head
 // as well, is false for a keep-alive connection (it closes it with the idle
 // ones).
+//
+// The README used to carry a paragraph on this and the test pinned four of its
+// sentences. The README is a front page and no longer carries it; the same
+// contract is on the docs site's graceful-shutdown page ("A request head that
+// is only half sent"), and the godoc assertions below already pin each of those
+// four statements in the godoc's own words: the head begun and not completed is
+// a request in progress on epoll and io_uring, ReadHeaderTimeout (10 s by
+// default, from the head's first byte) and WriteTimeout end the wait, the
+// caller's bound is the context's deadline, and std closes such a keep-alive
+// connection with the idle ones.
 func TestShutdownDocPartialHead1225(t *testing.T) {
 	doc := docText(t, "server.go", "Server", "Shutdown")
 	requireDocTagged(t, "celeris#1225", "Server.Shutdown", doc,
@@ -38,20 +44,4 @@ func TestShutdownDocPartialHead1225(t *testing.T) {
 		[]string{
 			"it holds Shutdown until the request completes or the budget ends, on epoll and io_uring alike",
 		})
-
-	b, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	readme := normaliseDoc(string(b))
-	for _, s := range []string{
-		"A connection that has begun a request head and not finished it (a fragment, or a bare CRLF) counts as a request in progress on epoll and io_uring",
-		"`ReadHeaderTimeout` (10 s by default, from the head's first byte, or for a new connection from its accept)",
-		"or until the context passed to `Shutdown` is done, so a client can hold a graceful shutdown for that long and the caller's bound is the context's deadline",
-		"std closes a keep-alive connection in that state with the idle ones, and waits for a new connection's first head as for a silent one",
-	} {
-		if !strings.Contains(readme, s) {
-			t.Errorf("README lacks %q (celeris#1225)", s)
-		}
-	}
 }
