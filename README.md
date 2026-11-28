@@ -62,6 +62,7 @@ ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SI
 defer stop()
 
 s := celeris.New(celeris.Config{Addr: ":8080", ShutdownTimeout: 15 * time.Second})
+s.GET("/hello", func(c *celeris.Context) error { return c.String(200, "Hello, World!") })
 if err := s.StartWithContext(ctx); err != nil {
 	log.Fatal(err)
 }
@@ -113,7 +114,7 @@ The figures come from a cross-framework benchmark on dedicated x86-64 and arm64 
 - **Linux is the production platform.** macOS and Windows run the `Std` engine, for development and testing.
 - **The database clients are beta** (see Status above).
 - **Idle CPU with open connections.** On the native engines, a server that holds connections open and is otherwise idle uses more CPU than a plain `net/http` server ([#1478](https://github.com/goceleris/celeris/issues/1478)).
-- **Light-load tail latency.** At light load the native engines' WebSocket echo p99 was about twice the `Std` engine's in two arm64 measurements ([#1318](https://github.com/goceleris/celeris/issues/1318), [#1380](https://github.com/goceleris/celeris/issues/1380)); not measured for HTTP.
+- **Light-load tail latency.** At light load the native engines' WebSocket echo p99 was about twice the `Std` engine's in two arm64 measurements ([#1318](https://github.com/goceleris/celeris/issues/1318), [#1380](https://github.com/goceleris/celeris/issues/1380)); not measured for HTTP. Where tail latency at light load matters more to you than peak throughput, use the `Std` engine.
 
 The full list for v1.6.0, with issue links, is in [Known limits in v1.6.0](https://goceleris.dev/docs/known-limits).
 
