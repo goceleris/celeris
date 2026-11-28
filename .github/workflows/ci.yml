@@ -2689,7 +2689,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: TestH2XNetLargeResponseVsStd809 (no race, no coverage)
         shell: bash
         run: |
@@ -2726,7 +2726,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Idle-wait tests under -race (skipping forbidden)
         shell: bash
         env:
@@ -3143,10 +3143,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # 1.27.4 fixes GO-2026-6859 (net/http); the scan reports the toolchain it
-          # runs with, so this job must run the fixed one, as the jobs that pin a
-          # version do. The module floor (go.mod, 1.27.3) is unchanged, and the jobs
-          # that read it with go-version-file keep resolving it.
+          # The scan reports the toolchain it runs with, so this job pins the same
+          # version as the module floor (go.mod, 1.27.4); the jobs that read the
+          # floor with go-version-file resolve it too.
           go-version: "1.27.4"
       # govulncheck is a `tool` of the separate .github/tools module, so the
       # version that runs is the one its go.mod names and its go.sum hashes
