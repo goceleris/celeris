@@ -108,11 +108,14 @@ func TestPort0IsHeldBetweenBeingChosenAndBeingBound895(t *testing.T) {
 	port := portOf895(t, r.e.Addr())
 	c := census895(t)
 	if n := c.listening[port]; n != workers {
-		t.Fatalf("%d sockets listen on port %d with the engine serving, want %d (one per worker)", n, port, workers)
+		t.Fatalf("%d sockets listen on port %d with the engine serving, want %d (one per worker); the process's sockets on the port: %s", n, port, workers, c.owned895(port))
 	}
-	if n := c.bound[port]; n != workers+1 {
-		t.Fatalf("%d sockets bound to port %d with the engine serving, want %d (one per worker and the hold)", n, port, workers+1)
+	// The hold: exactly one bound-only SO_REUSEPORT socket on the engine's
+	// address (holds895); other sockets of the process on the port are named.
+	if n := c.holds895(port); n != 1 {
+		t.Fatalf("%d bound-only SO_REUSEPORT sockets on port %d with the engine serving, want 1 (the hold); the process's sockets on the port: %s", n, port, c.owned895(port))
 	}
+	t.Logf("sockets on port %d: %s", port, c.owned895(port))
 	if err := r.stop(t); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

@@ -21,9 +21,19 @@ package epoll
 // a sweep tick, when the loop's next wake is a full wait away: without the wake
 // the lag of a cycle is then close to 100 ms and the median is not luck, with it
 // the lag is a few milliseconds, and one stalled cycle does not move a median.
-// And a rate is counted over a window of seconds as a count of the loop
-// thread's voluntary context switches, which a loaded runner does not raise (a
-// descheduled thread is an involuntary one).
+// WHAT THESE TESTS DO NOT CATCH. The wake-up bound counts the loop's own rounds,
+// not the thread's context switches: a thread that blocks elsewhere is not seen
+// (the switches are logged beside it, not asserted); an epoll_wait that returns
+// on a signal and is retried is not counted; a wake storm is a failure (every
+// sample must show an idle loop) only while it lasts through three windows. It
+// reads the loop through the sweep hook, which an empty loop hits at every tick.
+// TestLoopIsIdleAgainAfterTheLastConnectionCloses1381 still asserts the thread's
+// voluntary context switches.
+//
+// And a rate is counted over a window of seconds as the rounds the loop itself
+// made (its own count of empty rounds, read at its sweeps: idleWaitRate1381), not
+// as the thread's voluntary context switches, which include every other time the
+// thread blocked.
 
 import (
 	"bufio"
@@ -52,6 +62,16 @@ type idleStat1381 struct {
 	ticks      atomic.Int64 // sweeps made
 	empties    atomic.Int64 // consecutiveEmpty at the last sweep
 	liveSweeps atomic.Int64 // sweeps made while the loop held a connection
+
+	mu      sync.Mutex
+	samples []waitSample1381 // one per sweep, in order
+}
+
+// waitSample1381 is what the sweep hook reads at one sweep: the loop's count of
+// consecutive empty rounds, and when.
+type waitSample1381 struct {
+	at      time.Time
+	empties uint32
 }
 
 type idleProbe1381 struct{ stats sync.Map } // *Loop -> *idleStat1381
@@ -74,6 +94,9 @@ func probe1381(t *testing.T) *idleProbe1381 {
 		s.tid.Store(int64(unix.Gettid()))
 		s.ticks.Add(1)
 		s.empties.Store(int64(l.consecutiveEmpty))
+		s.mu.Lock()
+		s.samples = append(s.samples, waitSample1381{at: time.Now(), empties: l.consecutiveEmpty})
+		s.mu.Unlock()
 		if len(l.liveConns) > 0 {
 			s.liveSweeps.Add(1)
 		}
@@ -166,25 +189,154 @@ func median1381(d []time.Duration) time.Duration {
 	return s[len(s)/2]
 }
 
-// An idle loop blocks (wakes) at most idleWakeBound1381 times a second. Before
+// An idle loop waits on epoll at most idleWakeBound1381 times a second. Before
 // the change an idle epoll loop woke about 285 times a second (measured on CI:
 // 570 to 610 in 2 s per loop); after it about 10. The bound sits between them.
 const idleWakeBound1381 = 40
 
+// idleWaitRate1381 is the rate at which a loop, in the window that starts at from
+// and lasts at most window, went round its loop and so returned from epoll_wait,
+// from the loop's own count: each round of the loop makes one wait, and a round
+// that collected nothing, or only the sweep timer's tick, adds one to
+// consecutiveEmpty (loop.go, "Adaptive timeout tracking"), which the sweep hook
+// reads from the loop's thread at each sweep. Between the first and the last
+// sweep of the window the count grows by the rounds made between them, and the
+// time between the two is the hook's own. It reports false when a sample of the
+// window shows a count below idleEmpties1381 or one that fell (a round had an
+// event: the loop was not idle, and the rate cannot be read from the count), or
+// the window holds fewer than two sweeps a second apart. Three windows in a row
+// with events end the test in a failure, not in a rate.
+//
+// This replaces the loop thread's voluntary context switches (/proc/self/task/
+// <tid>/status), which the test used to bound: they are the loop's waits plus
+// every other time the thread blocked (the same method failed the io_uring idle
+// test twice on CI, celeris#1336 and celeris#1484). Over 20 runs of this test in
+// a container the loops' own count was 18 or 19 rounds in 2 s and the thread's
+// switches 21 to 40 in the same windows. The switches are still logged, not
+// asserted.
+//
+// What the test no longer catches: a thread that blocks somewhere other than in
+// the loop's own rounds (a lock, a channel, a syscall inside a handler), because
+// only rounds are counted; and an epoll_wait that returns on a signal (EINTR)
+// and is retried, which is not counted as a round. The logged switches would
+// show both. It also reads the loop through the sweep hook, which runs when
+// sweepDue says a walk is due: an idle loop holds no connection, and sweepDue
+// is true for a loop with none (len(liveConns) == 0), so the hook is hit at
+// every tick; if an empty loop is ever allowed to skip its walk, the hook goes
+// quiet and this test ends in the failure below, not in a pass.
+func idleWaitRate1381(p *idleProbe1381, l *Loop, from time.Time, window time.Duration) (rate float64, rounds uint32, ok bool) {
+	s := p.of(l)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var first, last *waitSample1381
+	for i := range s.samples {
+		x := &s.samples[i]
+		if x.at.Before(from) || x.at.After(from.Add(window)) {
+			continue
+		}
+		// Every sample of the window must show a loop that stayed idle: its count
+		// of empty rounds never fell below idleEmpties1381. A loop that is woken
+		// at every round by something that is not the timer (a producer that
+		// writes the wake descriptor) keeps the count at 0 or 1, which would read
+		// as a rate of nothing; it is not a window to count in.
+		if x.empties < idleEmpties1381 || (last != nil && x.empties < last.empties) {
+			return 0, 0, false
+		}
+		if first == nil {
+			first = x
+		}
+		last = x
+	}
+	if first == nil || last.at.Sub(first.at) < window/2 {
+		return 0, 0, false
+	}
+	rounds = last.empties - first.empties
+	return float64(rounds) / last.at.Sub(first.at).Seconds(), rounds, true
+}
+
+// TestIdleWaitRateReadsOnlyAnIdleLoop1381 pins what idleWaitRate1381 accepts, on
+// samples it is given: a loop whose count of empty rounds grows reads as that
+// growth; a count that stays at 0 or 1 (a loop woken at every round by
+// something that is not the timer, which reads as a rate of nothing if a window
+// of such samples were accepted), one that falls (an event reset it) and a
+// window with too few sweeps are not a reading.
+func TestIdleWaitRateReadsOnlyAnIdleLoop1381(t *testing.T) {
+	from := time.Now()
+	read := func(empties []uint32, step time.Duration) (float64, uint32, bool) {
+		p := &idleProbe1381{}
+		l := &Loop{}
+		s := p.of(l)
+		for i, e := range empties {
+			s.samples = append(s.samples, waitSample1381{at: from.Add(time.Duration(i) * step), empties: e})
+		}
+		return idleWaitRate1381(p, l, from, 2*time.Second)
+	}
+	ten := func(start uint32, per uint32) []uint32 {
+		var out []uint32
+		for i := uint32(0); i < 20; i++ {
+			out = append(out, start+i*per)
+		}
+		return out
+	}
+	if rate, rounds, ok := read(ten(150, 1), 100*time.Millisecond); !ok || rounds != 19 || rate < 9 || rate > 11 {
+		t.Errorf("an idle loop with one round a sweep read (rate %.1f, rounds %d, ok %v), want 19 rounds, about 10 a second", rate, rounds, ok)
+	}
+	if _, _, ok := read(ten(1, 0), 100*time.Millisecond); ok {
+		t.Error("a count held at 1 was accepted as a window: a loop woken at every round reads as a rate of nothing")
+	}
+	if _, _, ok := read(ten(0, 0), 100*time.Millisecond); ok {
+		t.Error("a count held at 0 was accepted as a window")
+	}
+	fell := ten(150, 1)
+	fell[10] = 2
+	if _, _, ok := read(fell, 100*time.Millisecond); ok {
+		t.Error("a count that fell to 2 was accepted as a window")
+	}
+	if _, _, ok := read(ten(150, 1)[:3], 100*time.Millisecond); ok {
+		t.Error("a window of three sweeps 0.2 s apart was accepted")
+	}
+}
+
 // TestIdleLoopWakeupsAreBounded1381 is the test that fails before the change:
-// three idle loops (the case the documentation measures), counted for 1.5 s once
-// every one of them has settled into its idlest wait.
+// three idle loops (the case the documentation measures), counted for 2 s once
+// every one of them has settled into its idlest wait. A window with an event in
+// it is taken again (up to three times: nothing but the loops themselves runs in
+// this engine).
 func TestIdleLoopWakeupsAreBounded1381(t *testing.T) {
 	p := probe1381(t)
 	r := start886(t, 3, 0, false)
 	loops := r.e.loopSnapshot()
 	waitIdle1381(t, p, loops)
-	const window = 1500 * time.Millisecond
-	got := wakeups1381(t, p, loops, window)
-	t.Logf("celeris1381 WAKEUPS %d idle loops, voluntary context switches in %v: %v (bound %d per second per loop)",
-		len(loops), window, got, idleWakeBound1381)
-	for i, n := range got {
-		if rate := float64(n) / window.Seconds(); rate > idleWakeBound1381 {
+	const window = 2 * time.Second
+	var rates []float64
+	var rounds []uint32
+	var switches []int64
+	for attempt := 0; attempt < 3; attempt++ {
+		from := time.Now()
+		switches = wakeups1381(t, p, loops, window)
+		rates, rounds = rates[:0], rounds[:0]
+		complete := true
+		for _, l := range loops {
+			rate, n, ok := idleWaitRate1381(p, l, from, window)
+			if !ok {
+				complete = false
+				break
+			}
+			rates, rounds = append(rates, rate), append(rounds, n)
+		}
+		if complete {
+			break
+		}
+		rates = nil
+		waitIdle1381(t, p, loops)
+	}
+	if rates == nil {
+		t.Fatalf("no window of %v in three tries was one in which every loop stayed idle (its count of empty rounds at or above %d at every sweep, and two sweeps a second apart): events reached an idle loop, or the sweep hook did not run", window, idleEmpties1381)
+	}
+	t.Logf("celeris1381 WAKEUPS %d idle loops, rounds of the loop (epoll waits) in %v: %v, a second: %.1f (bound %d per second per loop); voluntary context switches of their threads, not asserted: %v",
+		len(loops), window, rounds, rates, idleWakeBound1381, switches)
+	for i, rate := range rates {
+		if rate > idleWakeBound1381 {
 			t.Errorf("loop %d woke %.0f times a second while idle, want at most %d: the loop does not take a long wait with nothing to serve",
 				i, rate, idleWakeBound1381)
 		}
