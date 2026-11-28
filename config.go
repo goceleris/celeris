@@ -307,15 +307,21 @@ type Config struct {
 	// connections have nothing due does not walk them at every tick), so within
 	// about 30 ms (a 1 s IdleTimeout closed an idle connection at
 	// 1.00 to 1.03 s on docker arm64 with 2 CPUs, with ReadHeaderTimeout off as well
-	// as set). On io_uring the sweep of an idle worker is about 0.8 s apart (0.83 s
-	// measured; about 1 s with ReadHeaderTimeout off, and up to about 1.1 s,
-	// because an iteration notices the 1 s sweep ceiling at its end, after an idle
-	// ring wait of up to 100 ms; up to about 2 s on a paused or standby worker,
-	// which has no listener), so a timeout of a few seconds or less is
-	// approximate by that much there. An HTTP/2 connection takes one sweep more:
-	// the sweep that finds a request's deadline passed resets its stream, and the
-	// connection is closed by the next sweep, so a request that never arrives
-	// closes the connection about ReadTimeout plus two sweeps after it started.
+	// as set). On io_uring a sweep also works out when the next deadline of a
+	// connection falls due, and the worker sweeps then, as well as at the sweeps it
+	// made before (about 0.8 s apart on an idle worker, about 1 s with
+	// ReadHeaderTimeout off, up to about 2 s on a paused or standby worker, which
+	// has no listener). So the ReadTimeout or IdleTimeout of an HTTP/1 connection
+	// is met when it falls due, not at the next sweep of that period: the tests
+	// bound the close within 200 ms of the due time on a loaded runner (50 ms
+	// before it at the earliest), for an idle keep-alive connection, one whose body
+	// stalls, and one held by a paused worker. A deadline the sweep cannot see is
+	// met by the sweeps made before, within their old period of its due time: a
+	// connection inside an async handler, an HTTP/2 deadline set from a pool
+	// goroutine, and a WebSocket idle deadline moved by the middleware. An HTTP/2
+	// stream whose request never
+	// arrives is reset when ReadTimeout falls due, within the same bound; the
+	// connection is closed later, and that close is not covered by this bound.
 	// WriteTimeout is judged in windows that end at a sweep too: see
 	// WriteTimeout. The HTTP/1 header deadline, and the budget of a connection
 	// whose protocol is not decided yet, have a timer of their own on io_uring and
@@ -420,12 +426,16 @@ type Config struct {
 	// of HTTP/1 and hold with the epoll sweep at its 25 ms period, which every
 	// worker has whatever ReadHeaderTimeout and the other timeouts are; over
 	// HTTP/2 the connection is closed one sweep after its stream is reset.
-	// io_uring sweeps more coarsely, see ReadTimeout: there a parked response is
-	// closed at the first sweep after WriteTimeout has passed since its last
-	// activity, up to a sweep period late, and for an HTTP/2 response that is
-	// about WriteTimeout plus three sweeps on an idle worker (a client that took
-	// 64 KiB of an 8 MiB response, with a 2 s WriteTimeout, was closed at 3.13 to
-	// 3.96 s in CI).
+	// On io_uring the sweeps are paced as ReadTimeout says: a parked HTTP/1
+	// response is closed at the first sweep after WriteTimeout has passed since its
+	// last activity, and a send that starts makes the next look at that time, so
+	// the close comes when WriteTimeout falls due, not up to a sweep period after
+	// it. For an HTTP/2 response the client does not take, the window is set by the
+	// goroutine that writes: only an inline handler's, on the loop, is looked at
+	// when it falls due; a pooled handler's (the default) is set on a pool
+	// goroutine and is met at the old period, about WriteTimeout plus three sweeps
+	// on an idle worker (a client that took 64 KiB of an 8 MiB response, with a 2 s
+	// WriteTimeout, was closed at 3.13 to 3.96 s in CI).
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
