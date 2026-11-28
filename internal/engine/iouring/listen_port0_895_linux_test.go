@@ -50,6 +50,52 @@ type sockets895 struct {
 	// bound, and its SO_REUSEPORT. A census that finds a socket nobody expects
 	// (celeris#1104) then names it in the failure.
 	owners map[int][]string
+	// socks is the same sockets as owners, with the facts the checks use.
+	socks map[int][]sock895
+}
+
+// sock895 is one socket of the process on a port.
+type sock895 struct {
+	fd        int
+	local     string
+	listening bool
+	connected bool
+	reusePort bool
+}
+
+// holds895 counts the sockets on port that have the shape of the engine's port 0
+// hold: bound to the address the engine's listen sockets are bound to, with
+// SO_REUSEPORT set, neither listening nor connected. The engine has exactly one
+// while it serves (the hold, which never listens); the port's other sockets (a
+// connected one that has this port as its local port, a socket bound to another
+// address) are not counted, and are named by owned895 where a check fails.
+func (s sockets895) holds895(port int) int {
+	listens := map[string]bool{}
+	for _, k := range s.socks[port] {
+		if k.listening {
+			listens[k.local] = true
+		}
+	}
+	n := 0
+	for _, k := range s.socks[port] {
+		if !k.listening && !k.connected && k.reusePort && listens[k.local] {
+			n++
+		}
+	}
+	return n
+}
+
+// all895 is the sockets of every port the census saw, for a failure message that
+// has no one port to name.
+func (s sockets895) all895() string {
+	if len(s.owners) == 0 {
+		return "none"
+	}
+	var out []string
+	for _, p := range ports895(s.bound) {
+		out = append(out, fmt.Sprintf("port %d: %s", p, s.owned895(p)))
+	}
+	return strings.Join(out, "; ")
 }
 
 // owned895 is the owners of port, for a failure message.
@@ -70,7 +116,7 @@ func census895(t *testing.T) sockets895 {
 	if err != nil {
 		t.Fatalf("read /proc/self/fd: %v", err)
 	}
-	s := sockets895{bound: map[int]int{}, listening: map[int]int{}, owners: map[int][]string{}}
+	s := sockets895{bound: map[int]int{}, listening: map[int]int{}, owners: map[int][]string{}, socks: map[int][]sock895{}}
 	for _, ent := range ents {
 		fd, err := strconv.Atoi(ent.Name())
 		if err != nil {
@@ -99,14 +145,19 @@ func census895(t *testing.T) sockets895 {
 		}
 		s.bound[port]++
 		state := "bound only"
+		k := sock895{fd: fd, local: sockaddrString895(sa)}
 		if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN); err == nil && v == 1 {
 			s.listening[port]++
 			state = "listening"
+			k.listening = true
 		} else if peer, err := unix.Getpeername(fd); err == nil {
 			state = fmt.Sprintf("connected to %s", sockaddrString895(peer))
+			k.connected = true
 		}
 		reuse, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT)
-		s.owners[port] = append(s.owners[port], fmt.Sprintf("fd %d %s (SO_REUSEPORT=%d)", fd, state, reuse))
+		k.reusePort = reuse == 1
+		s.socks[port] = append(s.socks[port], k)
+		s.owners[port] = append(s.owners[port], fmt.Sprintf("fd %d %s on %s (SO_REUSEPORT=%d)", fd, state, k.local, reuse))
 	}
 	return s
 }
@@ -273,14 +324,19 @@ func TestPort0EveryWorkerBindsTheSamePort895(t *testing.T) {
 			c := census895(t)
 			t.Logf("Addr() = %s; LISTEN sockets by port: %v", r.e.Addr(), c.listening)
 			if got := ports895(c.listening); len(got) != 1 || got[0] != addrPort {
-				t.Fatalf("the engine listens on ports %v, want only the published %d", got, addrPort)
+				t.Fatalf("the engine listens on ports %v, want only the published %d; the process's sockets: %s", got, addrPort, c.all895())
 			}
 			if n := c.listening[addrPort]; n != workers {
-				t.Fatalf("%d listen sockets on port %d, want one per worker (%d)", n, addrPort, workers)
+				t.Fatalf("%d listen sockets on port %d, want one per worker (%d); the process's sockets on the port: %s", n, addrPort, workers, c.owned895(addrPort))
 			}
-			if n := c.bound[addrPort]; n != workers+1 {
-				t.Fatalf("%d sockets bound to port %d, want %d: one per worker and the engine's port 0 hold", n, addrPort, workers+1)
+			// The hold is one socket that is bound, has SO_REUSEPORT, and neither
+			// listens nor is connected, on the address the engine listens on. A
+			// socket of the process that is none of that (a connection whose local
+			// port this is) is no part of the engine's and is only named.
+			if n := c.holds895(addrPort); n != 1 {
+				t.Fatalf("%d bound-only SO_REUSEPORT sockets on port %d, want 1 (the engine's port 0 hold, beside one listen socket per worker); the process's sockets on the port: %s", n, addrPort, c.owned895(addrPort))
 			}
+			t.Logf("sockets on port %d: %s", addrPort, c.owned895(addrPort))
 			get895(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(addrPort)))
 		})
 	}
@@ -507,5 +563,78 @@ func TestResumeAfterThePortWasTaken895(t *testing.T) {
 	}
 	if err := r.stop(t); err != nil {
 		t.Fatalf("Listen: %v", err)
+	}
+}
+
+// TestCensusCountsTheHoldByItsShape895 pins what holds895 counts: one
+// listening socket and one bound-only SO_REUSEPORT socket on its address are
+// one hold; a connection accepted on the port, and a bound-only socket on
+// another address, are on the port and are not the hold; a second bound-only
+// socket on the same address is a second one, which the checks fail on.
+func TestCensusCountsTheHoldByItsShape895(t *testing.T) {
+	sock := func(host [4]byte, port int, listen bool) (int, int) {
+		t.Helper()
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("socket: %v", err)
+		}
+		t.Cleanup(func() { _ = unix.Close(fd) })
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			t.Fatalf("SO_REUSEPORT: %v", err)
+		}
+		if err := unix.Bind(fd, &unix.SockaddrInet4{Port: port, Addr: host}); err != nil {
+			t.Fatalf("bind: %v", err)
+		}
+		if listen {
+			if err := unix.Listen(fd, 4); err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+		}
+		sa, err := unix.Getsockname(fd)
+		if err != nil {
+			t.Fatalf("getsockname: %v", err)
+		}
+		return fd, sa.(*unix.SockaddrInet4).Port
+	}
+	lo := [4]byte{127, 0, 0, 1}
+	lfd, port := sock(lo, 0, true)
+	if n := census895(t).holds895(port); n != 0 {
+		t.Fatalf("holds895 = %d with a listening socket alone on the port, want 0", n)
+	}
+	sock(lo, port, false)
+	if n := census895(t).holds895(port); n != 1 {
+		t.Fatalf("holds895 = %d with a listening socket and one bound-only SO_REUSEPORT socket, want 1", n)
+	}
+	// A connection accepted on the port has the port as its local port.
+	c, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	afd, _, err := unix.Accept(lfd)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(afd) })
+	cs := census895(t)
+	if n := cs.holds895(port); n != 1 {
+		t.Fatalf("holds895 = %d with an accepted connection on the port, want 1: %s", n, cs.owned895(port))
+	}
+	accepted := false
+	for _, k := range cs.socks[port] {
+		accepted = accepted || k.connected
+	}
+	if !accepted {
+		t.Fatalf("no connected socket on the port after the accept: %s", cs.owned895(port))
+	}
+	// Another address, same port: not the hold.
+	sock([4]byte{127, 0, 0, 2}, port, false)
+	if n := census895(t).holds895(port); n != 1 {
+		t.Fatalf("holds895 = %d with a bound-only socket on another address, want 1", n)
+	}
+	// The same address: a second one.
+	sock(lo, port, false)
+	if n := census895(t).holds895(port); n != 2 {
+		t.Fatalf("holds895 = %d with a second bound-only SO_REUSEPORT socket on the engine's address, want 2", n)
 	}
 }
