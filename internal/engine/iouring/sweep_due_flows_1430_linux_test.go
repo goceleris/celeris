@@ -56,6 +56,8 @@ import (
 //     sweep branch checked; the flow column is documentation.
 //   - A read of a clock under a name that is neither a field of cs nor matches the
 //     clock-name pattern, by a function that is not in the sweep groups.
+//   - The scan for a new field sees only fields read through a variable named cs:
+//     a read through an alias (cc := cs; cc.expireAt) passes.
 //   - Path sensitivity beyond one block: a hook call must follow its start in
 //     the same block with no return or branch statement between them, and the
 //     one listed exception (flushSend's SQ-full return) is a reason, not a check.
@@ -524,19 +526,6 @@ func lookOK1430(e ast.Expr) string {
 	return "an expression the grammar does not know"
 }
 
-// exprText1430 prints an identifier or selector chain, "" for anything else.
-func exprText1430(e ast.Expr) string {
-	switch x := e.(type) {
-	case *ast.Ident:
-		return x.Name
-	case *ast.SelectorExpr:
-		if b := exprText1430(x.X); b != "" {
-			return b + "." + x.Sel.Name
-		}
-	}
-	return ""
-}
-
 // parsePackage1430 parses the non-test files of the package.
 func parsePackage1430(t *testing.T) map[string]*ast.File {
 	t.Helper()
@@ -576,7 +565,7 @@ func checkStarts1430(found []found1430, list []site1430) []string {
 		k := key{f.fn, f.field}
 		ss := listed[k]
 		if len(ss) == 0 {
-			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and is not in startSites1430: say which clock it starts and what looks at it")
+			probs = append(probs, f.file+" "+f.fn+" sets "+f.field+" and is not in startSites1430: say which clock it starts and what looks at it (or, if the field is state and no deadline, name it in notClock1430 with the reason)")
 			continue
 		}
 		seen[k]++
