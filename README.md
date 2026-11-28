@@ -55,7 +55,7 @@ func main() {
 
 Requires Go 1.27.4 or newer.
 
-Routes, groups and middleware work as in Gin and Echo. Handlers run inline on the event loop, so mount a route that blocks on I/O (a database or network call) with `.Async()` to keep the loop free:
+Routes, groups and middleware work as in Gin and Echo. On Linux, handlers run inline on an event loop, so mount a route that blocks on I/O (a database or network call) with `.Async()` to keep the loop free:
 
 ```go
 s := celeris.New(celeris.Config{Addr: ":8080"})
@@ -68,7 +68,7 @@ api.GET("/users/:id", func(c *celeris.Context) error {
 api.GET("/report", reportHandler).Async()
 ```
 
-**Engines.** On Linux, celeris runs one event loop per CPU on epoll (kernel 5.10 or later) or io_uring (5.19 or later); the default `Adaptive` engine starts on epoll and moves to io_uring under sustained load where the kernel allows it. On other systems, or when you choose `Std`, it runs on `net/http`. [Engines](https://goceleris.dev/docs/engines) has the details.
+**Engines.** On Linux, celeris runs pinned per-core event loops on epoll (kernel 5.10 or later) or io_uring (5.19 or later); the default `Adaptive` engine starts on epoll and moves to io_uring under sustained load where the kernel allows it. On other systems, or when you choose `Std`, it runs on `net/http`. [Engines](https://goceleris.dev/docs/engines) has the details.
 
 ## Why celeris
 
@@ -93,13 +93,13 @@ On plaintext GET with 1024 connections on linux/amd64, celeris's best configurat
 | linux/amd64 | [figure: filled from the cut-commit screen] | [figure: filled from the cut-commit screen] | [figure: filled from the cut-commit screen] |
 | linux/arm64 | [figure: filled from the cut-commit screen] | [figure: filled from the cut-commit screen] | [figure: filled from the cut-commit screen] |
 
-Celeris is not ahead everywhere. Tail latency at light load on the loop engines is the known gap (see [Known limits](#known-limits)), and the full results list every row where another server is level or ahead.
+Celeris is not ahead on every row: the full results show where another server is level or ahead, and [Known limits](#known-limits) lists a light-load tail-latency gap.
 
 The figures come from a cross-framework benchmark on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host. No tail-latency ranking is claimed from these runs: their latency passes carry a known load-generator limit ([loadgen#102](https://github.com/goceleris/loadgen/issues/102)). [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
 
 ## Status and stability
 
-- **Compatibility.** [GOVERNANCE.md](GOVERNANCE.md#compatibility) says: "From v1.6.0, the supported API is every exported identifier of the packages that have no `internal` element in their import path and are not marked experimental [...]. A minor or patch release [...] does not remove or change an exported identifier, a documented default or documented behaviour in a way that breaks code that uses it as documented. A change that would do so needs a new major version." The exported API is checked in CI against the golden files in [`api/`](api/). v1.5.x was not covered by this promise, and v1.6.0 removes and changes API compared with it: see [What's new](#whats-new-in-v160).
+- **Compatibility.** [GOVERNANCE.md](GOVERNANCE.md#compatibility) says: "From v1.6.0, the supported API is every exported identifier of the packages that have no `internal` element in their import path and are not marked experimental" (the list of packages follows there), and a supported package "does not remove or change an exported identifier, a documented default or documented behaviour in a way that breaks code that uses it as documented. A change that would do so needs a new major version." The exported API is checked in CI against the golden files in [`api/`](api/). v1.5.x was not covered by this promise, and v1.6.0 removes and changes API compared with it: see [What's new](#whats-new-in-v160).
 - **Database clients (beta).** The exported API of the PostgreSQL, Redis and memcached clients stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types and gaps per client: [PostgreSQL](https://goceleris.dev/docs/postgres-types), [Redis](https://goceleris.dev/docs/redis-replies), [memcached](https://goceleris.dev/docs/memcached-behavior).
 - **Maturity.** celeris is a young project with one maintainer ([MAINTAINERS.md](MAINTAINERS.md)). The native engines do not terminate TLS ([#446](https://github.com/goceleris/celeris/issues/446)): run celeris behind a TLS-terminating proxy, and benchmark it on your own workload.
 - **Platforms.** Linux is the production platform: io_uring needs kernel 5.19 or later, epoll 5.10 or later. macOS and Windows run the `Std` engine for development and testing ([platform support](https://goceleris.dev/docs/runtime-notes#platform-support)).
@@ -132,7 +132,7 @@ v1.6.0 removes and changes API although it is a minor release. Before you upgrad
 - HTTP/2 on the native engines: a context derived from `c.Context()` could panic the process, and a frame that arrived as an async handler returned could end it; both are fixed. A response held for a client's flow-control window is bounded, and a 64 MiB response to `x/net`'s `http2.Transport` now completes.
 - epoll and io_uring send a large response whole, keep pipelined responses in order, and no longer send a body after the handler has given it back.
 - The native engines' timeouts use a monotonic clock, so a wall-clock step no longer closes a connection that is making progress. io_uring checks a connection's `ReadTimeout` or `IdleTimeout` when it falls due.
-- With no connection open, an event loop waits 100 ms where it waited 4 ms, so an idle server wakes far less often.
+- With no connection open, an event loop waits 100 ms where it waited 4 ms, so a server with no connection open wakes far less often.
 - The root module builds for Windows (the `Std` engine serves there).
 - The PostgreSQL, Redis and memcached clients got many fixes, among them wrong results, calls that reported success wrongly, crashes, and hangs. v1.5.x receives no further releases: upgrade to v1.6.0. The release notes list each fix.
 
@@ -148,23 +148,23 @@ What is still open in v1.6.0, and what a change costs. Each line names its issue
 - **Idle CPU with open connections.** On the native engines a server that holds connections open and is otherwise idle uses more CPU than a plain `net/http` or `Std` server, because each loop keeps its short wait and sweep timer ([#1478](https://github.com/goceleris/celeris/issues/1478)).
 - **The first request after an idle period.** On epoll, the first request after a period with no connection open can be answered later than with v1.5.11's 4 ms wait, since an idle loop now waits 100 ms ([#1474](https://github.com/goceleris/celeris/pull/1474)).
 - **io_uring idle CPU with many connections.** The deadline check costs a little more idle CPU with 10,000 open connections ([#1494](https://github.com/goceleris/celeris/issues/1494)).
-- **io_uring deadline corner cases.** A few deadlines the worker cannot see are still met at the old sweep period, up to about a second after they fall due and never later than in v1.5.11; a fix is planned for v1.6.1 ([#1489](https://github.com/goceleris/celeris/issues/1489), [#1490](https://github.com/goceleris/celeris/issues/1490), [#1491](https://github.com/goceleris/celeris/issues/1491)).
+- **io_uring deadline corner cases.** A few connection deadlines (a detached connection, an HTTP/2 connection) are still checked at the old period, so a timeout can fire up to about a second after it falls due, never later than in v1.5.11; a fix is planned for v1.6.1 ([#1489](https://github.com/goceleris/celeris/issues/1489), [#1490](https://github.com/goceleris/celeris/issues/1490), [#1491](https://github.com/goceleris/celeris/issues/1491)).
 - **Light-load tail latency on the loop engines.** In one WebSocket echo run (async handlers, 64 connections, about 6,000 messages a second, one arm64 container) the round-trip p99 of epoll and adaptive was about twice the `Std` engine's; it is not shown to hold for HTTP in general ([#1380](https://github.com/goceleris/celeris/issues/1380)).
 - **`compress` and `Vary`.** An uncompressed response, where no encoding was negotiated, can lack `Accept-Encoding` in `Vary` when the handler set its own `Vary`; v1.5.11 does the same ([#1420](https://github.com/goceleris/celeris/issues/1420)).
 - **`Config.Workers` below 2 is refused** at start on every engine, so `runtime.GOMAXPROCS(0)` fails on a one-CPU host; use `max(2, runtime.GOMAXPROCS(0))` ([#1379](https://github.com/goceleris/celeris/issues/1379)).
 - **A port passed in a listener can be taken during the hand-over.** A `bind(0)` elsewhere in the process in that gap can take it, and `Listen` returns `address already in use` ([#1404](https://github.com/goceleris/celeris/issues/1404)).
-- **A failed epoll start is only partly covered by tests.** The listen-registration failure and the locking of the loop's first descriptor write have no test of their own ([#1377](https://github.com/goceleris/celeris/issues/1377)).
+- **A failed epoll start is only partly covered by tests.** Two failure paths when an epoll loop cannot start (registering its listen socket, and the first write of its descriptor) have no test of their own ([#1377](https://github.com/goceleris/celeris/issues/1377)).
 - **A 64 MiB HTTP/2 response on a busy host.** To `x/net`'s `http2.Transport` it completes in about 0.1 s on a quiet machine on the native engines, but while the host is busy with other work an occasional transfer takes seconds, up to about 2.2 s in the measurements ([#1423](https://github.com/goceleris/celeris/issues/1423), [#809](https://github.com/goceleris/celeris/issues/809)).
-- **A cancelled PostgreSQL direct-mode query returns after the cancel drain, not at its deadline,** bounded by one second plus thirty ([#1466](https://github.com/goceleris/celeris/issues/1466)).
+- **A cancelled PostgreSQL query can return late.** On a direct-mode pool (opened without `WithEngine`, or on a started server), the call waits for the server to answer the cancel and finish the statement's reply, so it can take up to about 31 s to return the context's error instead of returning at the deadline ([#1466](https://github.com/goceleris/celeris/issues/1466)).
 - **An unread HTTP/2 response can now live longer.** A stream whose client never reads is reset after up to eight `WriteTimeout` windows, where v1.5.11 closed it at `ReadTimeout`; set `WriteTimeout` lower if that is too long for your clients ([#1167](https://github.com/goceleris/celeris/pull/1167)).
 - **Stalls on big.LITTLE arm64 hosts.** On an arm64 host with CPUs of different capacity, the loop engines have stalled for over a second under load (io_uring at 512 connections, 2 of 8 runs, in v1.5.11 as well); the cause is not settled ([#1036](https://github.com/goceleris/celeris/issues/1036)).
 
-Database clients (beta), planned for v1.6.1:
+Database clients (beta), tracked on the v1.6.1 milestone:
 
 - An error from a write does not prove the write was not applied: do not blindly retry `Exec`, `QueryRow` with `RETURNING` or `Commit` in PostgreSQL, or `Incr` and `Decr` in memcached, after a connection error ([#1470](https://github.com/goceleris/celeris/issues/1470), [#1460](https://github.com/goceleris/celeris/issues/1460)).
 - PostgreSQL does not support `LISTEN` and `NOTIFY` delivery: the driver has no way to deliver notifications ([#1480](https://github.com/goceleris/celeris/issues/1480)).
 - Behind a connection pooler without prepared-statement support, set `auto_cache_statements=false` ([#1462](https://github.com/goceleris/celeris/issues/1462)).
-- PostgreSQL on the event-loop path: calls made right after the server closes or resets connections can fail several times in a row with `file descriptor not registered`, for a few milliseconds ([#1465](https://github.com/goceleris/celeris/issues/1465)).
+- PostgreSQL on a client opened with `WithEngine` on a server that has not started yet, or on the `Std` engine (the event-loop path, see [data stores](https://goceleris.dev/docs/data-stores)): calls made right after the server closes or resets connections can fail several times in a row with `file descriptor not registered`, for a few milliseconds ([#1465](https://github.com/goceleris/celeris/issues/1465)).
 - Redis `DoSlice` on a RESP3 reply of `[member, score]` pairs from a command without `WITHSCORES` or `WITHVALUES` returns an error: use `Do` ([#1353](https://github.com/goceleris/celeris/pull/1353)).
 
 ## Graceful shutdown
