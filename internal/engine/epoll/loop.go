@@ -188,6 +188,7 @@ type Loop struct {
 	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow         int64  // cached mono.Now(), refreshed once per events return
 	lastSweep         int64  // mono.Now() at the start of the last checkTimeouts, any caller; the run loop's gate tests it against sweepFloor (celeris#885 item 29)
+	nextDue           int64  // mono time from which the walk of the live conns is due (sweepDue): set by checkTimeouts, lowered where a clock starts between two walks (celeris#1430)
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
 	// above; all of them are nil-safe so a bare test Loop literal can skip
@@ -539,8 +540,9 @@ func (l *Loop) run(ctx context.Context) {
 		_ = unix.Close(efd)
 	}
 
-	// timerfd: forces checkTimeouts to run on a kernel-enforced 25ms
-	// cadence regardless of socket-event traffic. Without this, idle
+	// timerfd: forces a look at whether checkTimeouts is due (sweepDue,
+	// celeris#1430) on a kernel-enforced 25ms cadence regardless of
+	// socket-event traffic. Without this, idle
 	// or low-traffic workers ran checkTimeouts only every ~800ms in
 	// the worst case (gate × adaptive_wait), eating into the
 	// slowloris walker's 2s slack budget for slow refapps. Mirrors
@@ -773,7 +775,13 @@ func (l *Loop) run(ctx context.Context) {
 			if fd == l.timerFD && l.timerFD >= 0 {
 				var buf [8]byte
 				_, _ = unix.Read(l.timerFD, buf[:])
-				l.checkTimeouts()
+				// The tick still comes every sweepFloor, and what it skips is the
+				// walk: checkTimeouts runs when something is due (sweepDue,
+				// celeris#1430). The wake-up and the read of the timerfd are the
+				// same as before.
+				if l.sweepDue(mono.Now()) {
+					l.checkTimeouts()
+				}
 				timerOnly = n == 1
 				continue
 			}
@@ -978,7 +986,10 @@ func (l *Loop) run(ctx context.Context) {
 		// to sweepFloor plus the iterations of one gate stride after it
 		// expires, not 32 iterations after; the same 25 ms the timerfd gives
 		// a header deadline. A clock that stepped back (d < 0) sweeps, or
-		// the sweep would wait for the clock to catch up. The gate is every
+		// the sweep would wait for the clock to catch up. Since celeris#1430 the
+		// sweep is also made only when it is due (sweepDue): a gate hit that
+		// finds nothing due leaves the walk to the tick or the next gate hit that
+		// does. The gate is every
 		// 32 iterations whatever the timeouts are (celeris#1194; the v1.4.11
 		// slowloris defence tightened it for ReadHeaderTimeout alone, and the
 		// in-process synthetic reproducer,
@@ -990,7 +1001,8 @@ func (l *Loop) run(ctx context.Context) {
 		const gate = uint32(0x1F)
 		if l.tickCounter&gate == 0 {
 			// The clock is read at a gate hit only, one iteration in 32.
-			if d := mono.Now() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
+			gateNow := mono.Now()
+			if d := gateNow - l.lastSweep; d < 0 || (d >= int64(sweepFloor) && l.sweepDue(gateNow)) {
 				l.checkTimeouts()
 			}
 		}
@@ -2381,6 +2393,8 @@ func (l *Loop) markClosing(cs *connState, pending int) {
 	cs.closeSince = mono.Now()
 	cs.closePending = pending
 	cs.closeAckedKnown = false // a live conn's window baseline (parkedBelowRate) is not the drain's
+	// The first sample of the drain is owed to the next tick (celeris#1430).
+	l.lowerNextDue(cs.closeSince)
 }
 
 // noteClosingProgress restarts the drain clock of a conn markClosing deferred
@@ -4328,6 +4342,10 @@ func (l *Loop) armEpollOut(cs *connState) {
 	// flush is the backpressure path, not the common one.
 	if cs.writeSince == 0 {
 		cs.writeSince = mono.Now()
+		// Its first look (the baseline of the write-rate window) is owed to the
+		// next tick, as before the walk was skipped when nothing is due
+		// (celeris#1430).
+		l.lowerNextDue(cs.writeSince)
 	}
 	if cs.epollOut {
 		return
@@ -4469,6 +4487,7 @@ func (l *Loop) handleWritable(cs *connState) {
 				// rather than rely on a later flush reaching armEpollOut
 				// (celeris#885 items 35 and 45). The backpressure path.
 				cs.writeSince = mono.Now()
+				l.lowerNextDue(cs.writeSince) // as in armEpollOut (celeris#1430)
 			}
 		}
 	}
@@ -4695,7 +4714,8 @@ var timerfdCreate = unix.TimerfdCreate
 
 // sweepFloor is the least time between two checkTimeouts sweeps that the run
 // loop's iteration gate asks for, and the period of the timerfd that
-// guarantees one on an idle loop. A busy loop's iterations are well under a
+// guarantees a look at whether one is due (sweepDue, celeris#1430) on an idle
+// loop. A busy loop's iterations are well under a
 // millisecond apart, and a gate that counts them swept thousands of times a
 // second (celeris#885 item 29); this is the bound the timerfd already promises
 // a conn's header deadline.
@@ -4724,6 +4744,14 @@ var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
 // sweeps a second in all with no traffic (the timerfd alone gives 80), and
 // 1,800 to 6,200 a second in all with one to sixteen busy clients.
 //
+// Since celeris#1430 the tick and the gate call it only when a walk is due
+// (sweepDue, sweep_due_1430.go): it ends by storing, in nextDue, the earliest
+// time at which a later walk has anything to do, and a loop that holds
+// connections with nothing due walks them about once a second (sweepHorizon)
+// where it walked at every tick. A loop that holds an HTTP/2 connection or a
+// detached one, one with nothing to walk, and one with a dirty list keep the
+// cadence above. The tick itself, and so the wake-up, is unchanged.
+//
 // Iterates the dense liveConns slice (#318) rather than the sparse
 // 0..maxFD range, so the cost is O(active conns) regardless of FD space.
 // Iterating by REVERSE index is load-bearing: closeConn → removeLiveConn
@@ -4736,6 +4764,14 @@ func (l *Loop) checkTimeouts() {
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(l)
 	}
+	// The earliest time at which a later walk has anything to do (celeris#1430),
+	// as far as this walk can tell: each connection lowers it by what it holds
+	// (a deadline, or rearm when the walk cannot date what a state will decide
+	// and the next tick must look again), and it starts at the horizon. sweepDue
+	// reads it.
+	due := now + l.sweepHorizon()
+	rearm := now
+	idle := l.idleBound()
 	// The deadlines of the HTTP/2 streams and of the h2 conns' idle clock come
 	// first, before the scan of the conns' own clocks below: a request that has
 	// expired is answered 408 and reset, ONE stream, and the scan then finds the
@@ -4749,7 +4785,9 @@ func (l *Loop) checkTimeouts() {
 			// Handed to the application by an async Hijack, and waiting
 			// for its dispatch goroutine to hand it back (celeris#668):
 			// not this loop's to time out, and its descriptor number may
-			// already be another conn's.
+			// already be another conn's. It may come back with its clock
+			// as old as it was, so the next tick looks again.
+			due = min(due, rearm)
 			continue
 		}
 		fd := cs.fd
@@ -4763,9 +4801,12 @@ func (l *Loop) checkTimeouts() {
 		// established conns then never loads detectDeadline (RULE 74,
 		// BenchmarkCheckTimeouts865).
 		if !cs.detected {
-			if dl := cs.detectDeadline; dl > 0 && now > dl {
-				l.closeConn(fd)
-				continue
+			if dl := cs.detectDeadline; dl > 0 {
+				if now > dl {
+					l.closeConn(fd)
+					continue
+				}
+				due = min(due, dl+1)
 			}
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
@@ -4777,11 +4818,34 @@ func (l *Loop) checkTimeouts() {
 		// snapshotH1Deadlines. A conn whose lock is held by a bounded holder
 		// is skipped for this sweep and met again on a later one (not
 		// necessarily the next: the skip is probabilistic).
-		snap, ok := snapshotH1Deadlines(cs)
-		if !ok {
-			continue
+		var snap h1DeadlineSnapshot
+		if cs.detachMu == nil {
+			// A conn with no detach lock: the loop is the only writer of its
+			// h1State, and these are, in this order, the loads
+			// snapshotH1Deadlines makes when it has no lock to take. Inlined
+			// because the call is not (cost 262 against a budget of 80) and is
+			// paid once per conn per walk.
+			if h1 := cs.h1State; h1 != nil {
+				if snap.detached = h1.Detached.Load(); snap.detached {
+					snap.idleDL = h1.IdleDeadlineNs.Load()
+					snap.writePending = csWritePending(cs)
+				} else {
+					snap.hdrDL = h1.HeaderDeadlineNs.Load()
+				}
+			}
+		} else {
+			var ok bool
+			if snap, ok = snapshotH1Deadlines(cs); !ok {
+				// Nothing was read: the next tick looks again.
+				due = min(due, rearm)
+				continue
+			}
 		}
 		if snap.detached {
+			// The middleware owns its deadlines and moves them off the loop
+			// (sweepDue keeps a loop that holds one at the floor); here the
+			// next tick looks again.
+			due = min(due, rearm)
 			dl := snap.idleDL
 			if dl <= 0 || now <= dl {
 				// Unset, or pushed back out by the middleware (a WS frame
@@ -4842,6 +4906,9 @@ func (l *Loop) checkTimeouts() {
 		// Keyed on the clock, not peerClosed: a conn that carries
 		// peerClosed without it (a test fixture) takes the scan below.
 		if cs.closeSince != 0 {
+			// Sampled at every tick, as before: its first look was owed from
+			// markClosing (lowerNextDue).
+			due = min(due, rearm)
 			bound := l.closingDrainBound()
 			// A sample is due every quarter of the bound, and once more when
 			// the bound has passed since the last one was taken before it: the
@@ -4869,9 +4936,12 @@ func (l *Loop) checkTimeouts() {
 		// 26429150655 and predecessors), pointing at our extra syscalls
 		// racing with the walker's drip Write rather than at FIN/RST
 		// signaling. Simplest mirrors std.
-		if dl := snap.hdrDL; dl > 0 && now > dl {
-			l.closeConn(fd)
-			continue
+		if dl := snap.hdrDL; dl > 0 {
+			if now > dl {
+				l.closeConn(fd)
+				continue
+			}
+			due = min(due, dl+1)
 		}
 		// A response the kernel has not taken whole has its own clock
 		// (writeSince, celeris#885 items 35 and 45): lastActivity is the last
@@ -4883,6 +4953,10 @@ func (l *Loop) checkTimeouts() {
 		// clock nor a place on the dirty list, and pays one load and test.
 		last := cs.lastActivity
 		if cs.writeSince != 0 || cs.dirty {
+			// A parked or unflushed response is looked at at every tick, as
+			// before (its baseline, its window and its drain are samples of the
+			// sweep's own); its first look was owed from armEpollOut.
+			due = min(due, rearm)
 			var done bool
 			if last, done = l.sweepWriteClock(cs, fd, now, last); done {
 				continue
@@ -4898,10 +4972,12 @@ func (l *Loop) checkTimeouts() {
 			// the last read, does not move while it is exempt).
 			owes, ok := h2ServerOwes(cs)
 			if !ok {
+				due = min(due, rearm)
 				continue
 			}
 			if owes {
 				cs.noteH2Owed(now)
+				due = min(due, rearm)
 				continue
 			}
 			// No stream is owed now, but one was at an earlier sweep: the idle
@@ -4909,11 +4985,17 @@ func (l *Loop) checkTimeouts() {
 			// client's last frame, which is as old as the stream (net/http
 			// starts its idle timer when the last stream closes).
 			if at := cs.h2OwedAt(); at != 0 && !l.timeoutsDue(time.Duration(now-at)) {
+				due = min(due, rearm)
 				continue
 			}
 			l.closeConn(fd)
+		} else {
+			// Within its timeouts: due once last + min(IdleTimeout, ReadTimeout)
+			// has passed, the instant timeoutsDue turns true.
+			due = min(due, last+idle+1)
 		}
 	}
+	l.nextDue = due
 }
 
 // holdsOutput reports whether the conn still has bytes to get to its peer: in
